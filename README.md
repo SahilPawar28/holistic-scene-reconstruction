@@ -221,6 +221,31 @@ preview, mask overlay, per-stage stats — into the backend's history.
   absent. That is a property of the problem, not a gap in the implementation:
   the information is not in the photograph. Orbit far enough around a Tier 1
   scene and you are looking at the back of a shell.
+
+  This is the limitation people notice first, as black gaps that open up
+  around every object the moment you orbit away from the photo viewpoint.
+  It is worth being able to show that those gaps are *occlusion*, not a
+  meshing bug — `scripts/analyze_holes.py` measures exactly that. Across
+  three real photos (museum display case, cluttered desk, shop shelving):
+
+  | | holes at default | holes with culling **fully disabled** |
+  |---|---|---|
+  | museum jug | 2.6% of pixels | 2.5% |
+  | desk | 1.6% | 1.5% |
+  | shop shelf | 1.7% | 1.6% |
+
+  Turning edge-aware culling completely off recovers ~0.1% of pixels. The
+  gaps are not over-culling — there is no surface there to keep. The hole
+  map (`assets/diagnostics/*_holes.png`) shows the culled pixels as a thin
+  outline tracing each object's silhouette, which is precisely where an
+  occlusion boundary should be.
+
+  They *look* far bigger than 2% because a culled triangle spans a depth
+  jump over about one pixel: seen head-on it is a sliver of near-zero area,
+  but rotate the camera by θ and it opens into a gap roughly
+  `depth_jump × sin(θ)` wide. With a median depth discontinuity of 0.2 m,
+  a 30° orbit turns each sliver into an ~8 cm gap. Small culled fraction,
+  large black region — those are consistent, not contradictory.
 - **Tier 2 fills those gaps by inventing them.** TripoSR generates each
   object's unseen sides from a prior learned over ~800,000 3D models.
   Plausible and often convincing — but a guess, not a measurement. The
