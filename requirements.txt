@@ -14,8 +14,13 @@ scipy
 # results are noticeably better with it.
 opencv-python-headless
 
-# Only needed to run Depth Anything V2 / SAM2 locally instead of on Colab.
-# The Colab notebook installs its own versions; do not install these on a
-# 4GB-VRAM laptop expecting the large checkpoints to fit.
-# torch
-# transformers
+# Only needed to run Depth Anything V2 locally instead of on Colab, e.g.
+#   python scripts/seed_demo.py --image photo.jpg
+# torchvision is NOT optional despite never being imported directly —
+# transformers' AutoImageProcessor requires it and fails at load time
+# without it. Verified working CPU-only on a GTX 1650 machine with the
+# metric-indoor-small checkpoint (~15s per 960x1280 photo).
+#   pip install transformers
+#   pip install torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# SAM2 and TripoSR are Colab-only — do not expect them to fit in 4GB VRAM.
