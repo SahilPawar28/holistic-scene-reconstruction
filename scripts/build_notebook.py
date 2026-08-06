@@ -68,8 +68,11 @@ code("""
 !pip install -q -r /content/TripoSR/requirements.txt
 
 # SAM2 (instance segmentation) and Depth Anything V2 (via transformers).
+# Depth Anything V2 support landed in transformers 4.45 — Colab's
+# preinstalled version predates that and raises
+# "KeyError: 'depth_anything'" from AutoModel without this pin.
 !pip install -q "git+https://github.com/facebookresearch/sam2.git"
-!pip install -q transformers accelerate
+!pip install -q "transformers>=4.45.0" accelerate
 
 # Geometry + serving.
 !pip install -q trimesh scipy opencv-python-headless
