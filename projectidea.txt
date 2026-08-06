@@ -1,0 +1,247 @@
+PROJECT: Single-Image Full-Scene 3D Reconstruction
+=====================================================
+
+CONTEXT
+-------
+This is a follow-up to an existing project (already built, working) called
+"image-to-3d" — a single-OBJECT 2D photo -> 3D model pipeline using TripoSR,
+self-hosted on Google Colab (free T4 GPU) via FastAPI + ngrok, with a
+three.js frontend (chat-style history, lighting rig, orientation correction,
+download menu, before/after comparison panel, "how it works" explainer).
+That repo structure is:
+
+  image-to-3d/
+    README.md
+    .gitignore
+    backend/
+      main.py            <- FastAPI proxy: saves history, forwards to Colab
+      requirements.txt
+    frontend/
+      index.html          <- three.js viewer, chat-style UI
+    colab/
+      triposr_server.ipynb  <- self-hosted TripoSR + ngrok tunnel
+
+This was built for a take-home interview project (Hawk Aerosystems, drone/
+aerospace company). The interviewer reviewed it and said it's NOT what he
+wants. He wants the ENTIRE image turned into a 3D model — not just the main
+object, but everything visible: furniture, walls, floor, background objects,
+all of it, composited into one 3D scene.
+
+He was also explicit about one constraint: pretrained models ARE allowed as
+building blocks (perception/generation), but the assembly/combination logic
+connecting them must be code the student actually wrote. He rejected an
+"AI orchestrates Blender" idea specifically because there was no real
+engineering/logic being written — it was just gluing black boxes together
+via prompting.
+
+GOAL
+----
+Build a pipeline that takes ONE photo of a scene (e.g. a flower pot on a
+table in a room) and outputs ONE combined 3D scene (.glb) containing:
+  - The room shell (walls, floor, ceiling as approximated planes)
+  - Each distinct foreground object as its own complete 3D mesh
+  - All of it correctly positioned, scaled, and oriented relative to each
+    other, matching the original photo's layout
+
+This should reuse and extend the existing image-to-3d repo rather than
+starting over — same backend/frontend patterns, same Colab-hosting approach
+for GPU-heavy steps, same three.js viewer (extended to show a full scene
+instead of one object).
+
+HARDWARE / ENVIRONMENT CONSTRAINTS
+-----------------------------------
+- Local laptop: Windows, Ryzen 5 5600H, 16GB RAM, GTX 1650 (4GB VRAM).
+  NOT enough to run any of the neural components locally at full size.
+- Free Google Colab (T4 GPU, ~15GB VRAM) is the primary compute resource,
+  same pattern as the existing TripoSR notebook (install cell -> restart
+  session once for the numpy/cupy/scipy ABI conflict -> load model ->
+  define inference function -> FastAPI + ngrok server cell).
+- Everything must be achievable on free-tier compute. Do not assume access
+  to A100s or paid Colab unless explicitly noted as a stretch goal.
+
+WHY THIS ARCHITECTURE (validated against current research)
+------------------------------------------------------------
+This exact "divide and conquer" approach — depth + segmentation, then
+per-object 3D generation, then a custom assembly/placement step — mirrors
+how real published systems solve this problem (Gen3DSR, DeepPriorAssembly,
+3D-RE-GEN, SceneGen, MIDI-3D, PixARMesh — all 2024-2026 papers on
+"single-view holistic/compositional scene reconstruction"). The reference
+end-to-end systems all need 16-30GB+ VRAM and are research-grade
+(dataset-oriented, painful installs), so they are NOT directly runnable on
+free Colab — but their *architecture* is exactly what we're building a
+lighter, self-coded version of. This is worth mentioning to the interviewer:
+"I researched the current CVPR/3DV 2026 approaches to this exact problem
+and built a scoped-down version of the same architecture."
+
+Two useful reference implementations to actually borrow logic from:
+- DeepPriorAssembly (NeurIPS 2024, github.com/junshengzhou/DeepPriorAssembly)
+  ships a standalone 5-DOF layout optimizer (registration/optimization_5dof.py)
+  that fits a generated object mesh's position/orientation/scale by matching
+  it against a segmentation mask + estimated depth, minimizing matching
+  error. This is the closest existing reference for the hardest part of this
+  project (the assembly/placement step) — read it, adapt the approach, don't
+  just paste it in unmodified. License: check before copying code directly.
+- 3D-RE-GEN (Dec 2025, github.com/cgtuebingen/3D-RE-GEN, MIT license) is the
+  most complete modern reference matching this exact goal (objects + room
+  background from one indoor photo). Good architectural template to read.
+
+ARCHITECTURE (staged, build in this order)
+--------------------------------------------
+
+STAGE 0 — Baseline references (do this first, half a day)
+  Before building anything, test:
+  - MIDI-3D's Hugging Face Space (huggingface.co/spaces, search VAST-AI/MIDI-3D)
+    on a few of our own test photos, to see what a real SOTA compositional
+    system produces. Screenshot for comparison later.
+  - Immersity AI (immersity.ai, free tier) on the same photos, for the
+    "naive whole-image depth pop-out" reference point.
+  These give two comparison points to frame our own results against.
+
+STAGE 1 — Tier 1: whole-scene continuous mesh (guaranteed-to-work fallback)
+  Ship this FIRST so there's always a working demo, before attempting the
+  harder Stage 2 pipeline.
+  1. Run Depth Anything V2 (Small or Base checkpoint) on the full input
+     image -> per-pixel depth map. Runs fine on Colab T4, Small variant may
+     even run locally on the 4GB GPU at reduced resolution.
+  2. Unproject every pixel to a 3D point using the depth value + an assumed/
+     estimated camera focal length (pinhole camera model — this is real
+     code to write, not a library call).
+  3. Triangulate the resulting grid into a mesh: each 2x2 block of adjacent
+     pixels becomes two triangles, EXCEPT skip triangles that span a large
+     depth discontinuity (edge-aware culling) — otherwise you get "skin"
+     artifacts stretching from foreground objects to the background. This
+     discontinuity threshold is a tunable parameter worth exposing.
+  4. Texture the mesh directly from the source image's pixel colors.
+  5. Export as .glb, load in the existing three.js viewer (extend it to
+     handle one large scene mesh instead of one small object — the existing
+     centering/framing logic will need adjusting for a much bigger bounding
+     box).
+  Known, honest limitation to document clearly: this only reconstructs
+  VISIBLE surfaces. The back of any object, anything occluded, anything
+  outside the camera's view — none of that can exist in the output. This
+  is a fundamental fact of single-image geometry, not an implementation
+  gap, and should be stated plainly in the README and to the interviewer.
+
+STAGE 2 — Tier 2: compositional scene (the real project)
+  1. Instance segmentation: run SAM2 (or Grounded-SAM if class labels are
+     wanted) on the full image -> a mask per distinct foreground object
+     (e.g. separate masks for the pot, the table, any other objects).
+  2. Room shell: take the depth points NOT covered by any object mask (the
+     background — walls, floor, ceiling) and fit planes to them via RANSAC
+     (Open3D's segment_plane, called iteratively to peel off multiple
+     planes, or the pyransac3d library). Assemble the fitted planes into a
+     simple room-shell mesh. This is real code to write and tune — expect
+     it to need iteration on threshold/inlier parameters, and expect
+     imperfect results on cluttered scenes (partially occluded walls,
+     windows, etc. — document these as known limitations, don't hide them).
+  3. Per-object meshes: for each object mask, crop the image to that
+     object's bounding box, cut out the background (reuse the existing
+     background-removal step from the current TripoSR pipeline), and run
+     TripoSR on the crop — exactly the same model already integrated in
+     colab/triposr_server.ipynb, just called once per detected object
+     instead of once per image. Batch these calls in the same Colab
+     session to avoid repeated model-loading overhead.
+  4. Assembly / placement (the hardest, most important part — THIS is the
+     "real engineering" piece the interviewer is asking for):
+     For each object's generated mesh:
+       a. Back-project that object's masked pixels through the depth map
+          (using the same camera model as Stage 1) to get a target 3D
+          point cloud — "where this object actually sits in space,
+          according to the photo."
+       b. TripoSR outputs a mesh in some canonical/normalized pose and
+          scale, not the real-world one. Solve for the transform (scale,
+          translation, and eventually rotation) that best aligns the
+          generated mesh to that target point cloud.
+       c. Recommended solving order (this is the approach used in similar
+          published work): first solve isotropic scale + translation with
+          rotation held fixed, using a one-sided Chamfer-distance-style
+          objective comparing the mesh's visible-side vertices to the
+          target point cloud (rotation gives a weak/noisy signal under
+          heavy occlusion, so solving it first is unstable — fix it later).
+          Then refine rotation with an ICP-style refinement pass.
+       d. Snap the object's base to the nearest fitted floor plane from
+          step 2, to fix vertical drift/floating.
+     Write this as a genuinely own, understood implementation — study
+     DeepPriorAssembly's optimizer for the approach, but write your own
+     version suited to this simpler pipeline (no need to reproduce their
+     full generality).
+  5. Compose the room shell + all placed object meshes into a single
+     scene graph, export as one .glb.
+  6. Extend the existing three.js viewer to load a full scene instead of
+     a single object — same lighting rig, same orbit controls, same
+     download/compare features, just handling multiple meshes with
+     independent transforms instead of one.
+
+STAGE 3 — Polish / comparison writeup (optional, do if time allows)
+  Document (in the README, and worth having ready verbally for the
+  interview): side-by-side of Tier 1 vs Tier 2 vs the Stage 0 baselines
+  (MIDI-3D, Immersity AI) on the same test photos, and an honest list of
+  failure cases (heavily occluded objects, thin structures, ambiguous
+  scale, cluttered backgrounds). This trade-off narrative is itself a
+  strong thing to bring to the interview — it demonstrates understanding
+  of why the problem is hard, not just an attempt to hide the rough edges.
+
+KNOWN HARD LIMITATIONS TO BE UPFRONT ABOUT
+--------------------------------------------
+- Single-image reconstruction is fundamentally ill-posed: anything not
+  visible in the photo (object backs, occluded regions, anything outside
+  frame) is either simply absent (Tier 1) or generated/guessed by TripoSR's
+  learned prior (Tier 2, per-object). Be explicit about this distinction.
+- Monocular depth is relative, not metric — without known camera intrinsics,
+  absolute scale is ambiguous. The assembly step needs to handle this
+  (e.g. fix one object's scale as reference, or estimate a focal length and
+  hold it constant across the whole scene) rather than assuming true-to-life
+  measurements.
+- Expect rough edges on cluttered/complex scenes. A clean single-object photo
+  (what the original TripoSR pipeline handles well) is a much easier case
+  than a messy real room. Scope test images accordingly, especially early on
+  — start with simple, well-separated scenes (e.g. one object clearly on one
+  table against a plain wall) before attempting cluttered rooms.
+
+DELIVERABLE / FILE STRUCTURE
+-------------------------------
+Extend the existing image-to-3d repo. Suggested new additions:
+
+  image-to-3d/
+    backend/
+      main.py                  <- extend: new endpoint(s) for scene pipeline
+    colab/
+      triposr_server.ipynb     <- existing, reused for per-object step
+      scene_pipeline.ipynb     <- NEW: depth + SAM2 + room-shell + assembly,
+                                   hosted the same way (Colab + ngrok)
+    pipeline/
+      depth.py                 <- Depth Anything V2 wrapper, unprojection math
+      segmentation.py          <- SAM2 wrapper
+      room_shell.py            <- RANSAC plane fitting -> shell mesh
+      assembly.py               <- the placement/alignment solver (core logic)
+      scene_compose.py         <- combines shell + placed objects -> .glb
+    frontend/
+      index.html                <- extend viewer for multi-mesh scenes
+    README.md                   <- update with new architecture, limitations,
+                                   and Stage 0 baseline comparisons
+
+SUCCESS CRITERIA
+-----------------
+Minimum (must-have): Stage 1 working end-to-end on at least 3 test photos,
+clearly explained limitations, viewable in the existing three.js viewer.
+
+Target: Stage 2 working on at least one clean, simple test scene (e.g. one
+object on a table against a plain wall) — room shell roughly correct,
+object mesh present and roughly in the right place/scale, visibly imperfect
+is fine as long as it's clearly working and explainable.
+
+Stretch: Stage 2 working reasonably on a genuinely cluttered multi-object
+room photo, plus the Stage 3 comparison writeup.
+
+REFERENCES
+----------
+- Existing pipeline this builds on: TripoSR (github.com/VAST-AI-Research/TripoSR)
+- DeepPriorAssembly (assembly/placement reference):
+  github.com/junshengzhou/DeepPriorAssembly
+- 3D-RE-GEN (architectural reference): github.com/cgtuebingen/3D-RE-GEN
+- MIDI-3D (baseline comparison): github.com/VAST-AI-Research/MIDI-3D,
+  Hugging Face Space search "VAST-AI/MIDI-3D"
+- SceneGen (reference only, heavy install): github.com/Mengmouxu/SceneGen
+- Depth Anything V2: github.com/DepthAnything/Depth-Anything-V2
+- SAM2: github.com/facebookresearch/sam2
+- Immersity AI (baseline comparison, consumer tool): immersity.ai

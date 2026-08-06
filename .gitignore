@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Saved reconstructions — regenerate with scripts/seed_demo.py or the app.
+backend/history/
+# Per-session Colab tunnel URL.
+backend/config.json
+
+*.glb
+*.ply
+*.obj
+!assets/**/*.glb
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

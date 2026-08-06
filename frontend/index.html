@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Photo → 3D Scene</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0f0f12; font-family: system-ui, sans-serif; color: #eee; }
+  #app { display: flex; height: 100%; }
+
+  /* left: chat-style sidebar */
+  #sidebar { width: 340px; min-width: 340px; background: #17171b; border-right: 1px solid #26262c; display: flex; flex-direction: column; }
+  #sidebar-header { padding: 14px 16px; font-weight: 600; border-bottom: 1px solid #26262c; font-size: 14px; }
+
+  #server-row { padding: 10px 12px; border-bottom: 1px solid #26262c; display: flex; gap: 6px; align-items: center; }
+  #serverUrl { flex: 1; background: #101014; border: 1px solid #2c2c34; color: #ddd; border-radius: 7px; padding: 7px 9px; font-size: 11px; font-family: ui-monospace, monospace; min-width: 0; }
+  #serverSave { background: #2a2a33; border: none; color: #eee; padding: 7px 10px; border-radius: 7px; cursor: pointer; font-size: 11px; }
+  #serverSave:hover { background: #35353f; }
+  #serverDot { width: 9px; height: 9px; border-radius: 50%; background: #555; flex-shrink: 0; }
+  #serverDot.ok { background: #4ad07a; }
+  #serverDot.bad { background: #ff6b6b; }
+
+  #mode-row { display: flex; gap: 6px; padding: 10px 12px; border-bottom: 1px solid #26262c; }
+  .mode-btn { flex: 1; background: #1d1d22; border: 1px solid #2c2c34; color: #9a9aa5; padding: 8px 4px; border-radius: 8px; cursor: pointer; font-size: 11px; text-align: center; line-height: 1.35; }
+  .mode-btn:hover { background: #26262e; }
+  .mode-btn.active { background: #253059; border-color: #6d8bff; color: #fff; }
+  .mode-btn b { display: block; font-size: 12px; }
+
+  #chat-list { flex: 1; overflow-y: auto; padding: 10px; }
+  .chat-item { display: flex; gap: 10px; padding: 10px; border-radius: 10px; cursor: pointer; margin-bottom: 8px; background: #1d1d22; align-items: center; position: relative; }
+  .chat-item:hover { background: #26262e; }
+  .chat-item.active { outline: 2px solid #6d8bff; }
+  .chat-item img { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; background: #000; }
+  .chat-item .meta { font-size: 12px; color: #9a9aa5; overflow: hidden; flex: 1; }
+  .chat-item .meta .name { color: #eee; font-size: 13px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 165px; }
+  .chat-item.pending { opacity: 0.6; }
+  .badge { display: inline-block; font-size: 9px; padding: 1px 5px; border-radius: 4px; margin-right: 5px; vertical-align: 1px; letter-spacing: 0.03em; }
+  .badge.object { background: #3a3a44; color: #bbb; }
+  .badge.tier1 { background: #204a3a; color: #7fe0b0; }
+  .badge.tier2 { background: #2b2a5c; color: #a9b4ff; }
+  .delete-btn { background: none; border: none; color: #666; font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px; line-height: 1; }
+  .delete-btn:hover { background: #3a2222; color: #ff6b6b; }
+
+  #chat-input { padding: 12px; border-top: 1px solid #26262c; display: flex; gap: 8px; }
+  #fileInput { display: none; }
+  #attachBtn, #sendBtn { background: #2a2a33; border: none; color: #eee; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  #attachBtn:hover, #sendBtn:hover { background: #35353f; }
+  #sendBtn { background: #33407a; }
+  #sendBtn:hover { background: #3e4d92; }
+  #sendBtn:disabled { background: #2a2a33; color: #666; cursor: wait; }
+  #fileNameLabel { flex: 1; font-size: 12px; color: #9a9aa5; align-self: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* right: viewer */
+  #viewer-pane { flex: 1; position: relative; min-width: 0; }
+  #viewer { width: 100%; height: 100%; cursor: grab; }
+  #viewer.grabbing { cursor: grabbing; }
+
+  #topbar { position: absolute; top: 16px; left: 16px; right: 16px; z-index: 10; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; pointer-events: none; }
+  #topbar > * { pointer-events: auto; }
+  #status { background: rgba(20,20,24,0.88); padding: 8px 12px; border-radius: 8px; font-size: 13px; color: #9aa; max-width: 46%; }
+  #topbar-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .topbar-btn { background: rgba(20,20,24,0.88); border: 1px solid #33333c; color: #eee; padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .topbar-btn:hover { background: #26262e; }
+  .topbar-btn.on { border-color: #6d8bff; color: #b9c6ff; }
+
+  #download-wrap { position: relative; }
+  #download-menu { display: none; position: absolute; top: 40px; right: 0; background: #1d1d22; border: 1px solid #33333c; border-radius: 10px; overflow: hidden; min-width: 230px; z-index: 20; }
+  #download-menu.open { display: block; }
+  #download-menu button { width: 100%; text-align: left; background: none; border: none; color: #eee; padding: 10px 14px; cursor: pointer; font-size: 13px; display: block; }
+  #download-menu button:hover { background: #2a2a33; }
+
+  /* preview panel with original / depth / masks tabs */
+  #compare-panel { position: absolute; top: 62px; right: 16px; z-index: 9; background: rgba(20,20,24,0.92); border: 1px solid #26262c; border-radius: 12px; padding: 10px; width: 230px; display: none; }
+  #compare-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .cmp-tab { flex: 1; background: #1d1d22; border: 1px solid #2c2c34; color: #8a8a95; font-size: 10px; padding: 5px 2px; border-radius: 6px; cursor: pointer; }
+  .cmp-tab.active { background: #253059; border-color: #6d8bff; color: #fff; }
+  .cmp-tab:disabled { opacity: 0.35; cursor: not-allowed; }
+  #compareImg { width: 100%; border-radius: 8px; display: block; background: #000; }
+  #compareCaption { font-size: 10px; color: #777; margin-top: 6px; line-height: 1.4; }
+
+  /* pipeline stats */
+  #stats-panel { position: absolute; top: 62px; right: 258px; z-index: 9; background: rgba(20,20,24,0.94); border: 1px solid #26262c; border-radius: 12px; padding: 12px 14px; width: 300px; max-height: calc(100% - 150px); overflow-y: auto; display: none; font-size: 11px; }
+  #stats-panel h4 { margin: 0 0 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #7d8bd0; }
+  #stats-panel .grp { margin-bottom: 12px; }
+  #stats-panel .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; color: #a8a8b4; border-bottom: 1px solid #202027; }
+  #stats-panel .row span:last-child { color: #e2e2ea; font-family: ui-monospace, monospace; text-align: right; }
+  #stats-panel .warn { color: #ffb46b; }
+
+  #light-controls { position: absolute; bottom: 16px; left: 16px; z-index: 10; background: rgba(20,20,24,0.88); padding: 10px 14px; border-radius: 10px; font-size: 12px; }
+  #light-controls label { display: block; margin-bottom: 4px; color: #9a9aa5; }
+  #brightness { width: 180px; }
+  #hint { margin-top: 8px; color: #666; font-size: 11px; }
+
+  #orient-controls { position: absolute; bottom: 16px; left: 240px; z-index: 10; background: rgba(20,20,24,0.88); padding: 10px 14px; border-radius: 10px; font-size: 12px; }
+  #orient-controls label { display: block; margin-bottom: 6px; color: #9a9aa5; }
+  #orient-buttons { display: flex; gap: 6px; }
+  #orient-buttons button { background: #2a2a33; border: none; color: #eee; padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  #orient-buttons button:hover { background: #35353f; }
+  #orientReset { color: #ff8a8a; }
+
+  #modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 100; align-items: center; justify-content: center; }
+  #modal-backdrop.open { display: flex; }
+  #modal { background: #17171b; border: 1px solid #2a2a33; border-radius: 14px; max-width: 640px; width: 92%; max-height: 84vh; overflow-y: auto; padding: 24px; }
+  #modal h2 { margin-top: 0; font-size: 18px; }
+  #modal h3 { font-size: 13px; color: #7d8bd0; text-transform: uppercase; letter-spacing: 0.05em; margin: 22px 0 10px; }
+  #modal .step { display: flex; gap: 12px; margin-bottom: 14px; }
+  #modal .step-num { flex-shrink: 0; width: 26px; height: 26px; border-radius: 50%; background: #2a2a33; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; }
+  #modal .step-body b { display: block; margin-bottom: 3px; font-size: 14px; }
+  #modal .step-body p { margin: 0; font-size: 13px; color: #aaa; line-height: 1.55; }
+  #modal .caveat { background: #241d16; border-left: 3px solid #c8873c; padding: 12px 14px; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #d3bda2; line-height: 1.6; }
+  #modal-close { background: #2a2a33; border: none; color: #eee; padding: 8px 16px; border-radius: 8px; cursor: pointer; margin-top: 14px; float: right; }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="sidebar">
+    <div id="sidebar-header">🖼️ → 🏠 Photo to 3D Scene</div>
+
+    <div id="server-row">
+      <div id="serverDot" title="Colab server status"></div>
+      <input id="serverUrl" placeholder="https://….ngrok-free.dev" spellcheck="false" />
+      <button id="serverSave">Set</button>
+    </div>
+
+    <div id="mode-row">
+      <button class="mode-btn" data-mode="object"><b>Object</b>v1 — one object</button>
+      <button class="mode-btn active" data-mode="tier1"><b>Tier 1</b>whole scene</button>
+      <button class="mode-btn" data-mode="tier2"><b>Tier 2</b>compositional</button>
+    </div>
+
+    <div id="chat-list"></div>
+
+    <div id="chat-input">
+      <button id="attachBtn">+ Image</button>
+      <div id="fileNameLabel">No image selected</div>
+      <input type="file" id="fileInput" accept="image/*" />
+      <button id="sendBtn">Build</button>
+    </div>
+  </div>
+
+  <div id="viewer-pane">
+    <div id="viewer"></div>
+
+    <div id="topbar">
+      <div id="status">Pick an image and a mode, then hit Build.</div>
+      <div id="topbar-actions">
+        <button class="topbar-btn" id="photoViewBtn" title="Put the camera exactly where the photo was taken">📷 Photo view</button>
+        <button class="topbar-btn" id="orbitViewBtn" title="Pull back to see the whole scene">🛰 Orbit view</button>
+        <button class="topbar-btn" id="wireBtn" title="Show the triangulation">◫ Wireframe</button>
+        <button class="topbar-btn" id="statsBtn" title="Per-stage pipeline diagnostics">📊 Stats</button>
+        <button class="topbar-btn" id="howItWorksBtn">❓ How it works</button>
+        <div id="download-wrap">
+          <button class="topbar-btn" id="downloadBtn">⬇ Download</button>
+          <div id="download-menu">
+            <button id="dlModel">3D scene (.glb)</button>
+            <button id="dlImage">Original image</button>
+            <button id="dlDepth">Depth map (.png)</button>
+            <button id="dlScreenshot">Screenshot of this view (.png)</button>
+            <button id="dlStats">Pipeline stats (.json)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="compare-panel">
+      <div id="compare-tabs">
+        <button class="cmp-tab active" data-view="image">Photo</button>
+        <button class="cmp-tab" data-view="depth">Depth</button>
+        <button class="cmp-tab" data-view="overlay">Masks</button>
+      </div>
+      <img id="compareImg" src="" alt="" />
+      <div id="compareCaption"></div>
+    </div>
+
+    <div id="stats-panel"></div>
+
+    <div id="light-controls">
+      <label>Brightness (scroll here, or drag)</label>
+      <input type="range" id="brightness" min="0" max="3" step="0.05" value="1" />
+      <div id="hint">💡 Drag the yellow dot to move the fill light.</div>
+    </div>
+
+    <div id="orient-controls">
+      <label>Straighten model</label>
+      <div id="orient-buttons">
+        <button data-axis="x" title="Tilt forward/back">Tilt X</button>
+        <button data-axis="y" title="Spin left/right">Spin Y</button>
+        <button data-axis="z" title="Roll left/right">Roll Z</button>
+        <button id="orientReset" title="Undo all rotation fixes">Reset</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="modal-backdrop">
+  <div id="modal">
+    <h2>How one photo becomes a whole 3D scene</h2>
+    <p style="font-size:13px;color:#aaa;line-height:1.6;margin-top:0;">
+      Pretrained models do the perception and the generation. The geometry
+      that connects them — the camera model, the meshing, the plane fitting,
+      the placement solver — is this project's own code.
+    </p>
+
+    <h3>Tier 1 — whole-scene mesh</h3>
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body"><b>Depth estimation</b><p><i>Depth Anything V2</i> predicts a depth value for every pixel of the photo.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body"><b>Unprojection</b><p>Each pixel plus its depth is turned into a 3D point through a pinhole camera model. Focal length comes from EXIF when the photo carries it, and from an assumed 60° field of view when it doesn't.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body"><b>Edge-aware triangulation</b><p>Neighbouring pixels are joined into triangles — except where they straddle a depth jump, or where the resulting triangle would be nearly edge-on to the camera. Without those two tests, every object gets welded to the wall behind it by a sheet of stretched "skin". Toggle <b>Wireframe</b> to see the result.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body"><b>Texturing</b><p>The photo itself becomes the texture: every vertex knows which pixel it came from, so no colour is resampled or invented.</p></div>
+    </div>
+
+    <h3>Tier 2 — compositional scene</h3>
+    <div class="step">
+      <div class="step-num">5</div>
+      <div class="step-body"><b>Instance segmentation</b><p><i>SAM2</i> proposes masks; custom filtering reduces ~100 raw masks to the handful that are actually distinct foreground objects, discarding structure, duplicates and sub-parts.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-num">6</div>
+      <div class="step-body"><b>Room shell</b><p>Every pixel <i>not</i> claimed by an object is back-projected, and planes are fitted to that cloud with RANSAC to recover the floor, walls and ceiling. Candidate inliers must match the plane in surface orientation, not just distance — otherwise a tilted plane grazing a wall collects thousands of wall pixels and passes as a floor.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-num">7</div>
+      <div class="step-body"><b>Per-object generation</b><p>Each object is cropped out using its own mask and passed through <i>TripoSR</i>, which produces a complete mesh — including the parts the camera never saw.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-num">8</div>
+      <div class="step-body"><b>Placement</b><p>Each generated mesh arrives in an arbitrary canonical pose. Solving for the scale, position and rotation that make it match where the object really sits — measured against its own back-projected points — is the core of the project.</p></div>
+    </div>
+
+    <h3>What single-image reconstruction cannot do</h3>
+    <div class="caveat">
+      <b>Tier 1 only ever reconstructs visible surfaces.</b> The back of every
+      object, anything behind anything else, and anything outside the frame
+      is simply absent. That is a property of the problem, not a gap in the
+      implementation — the information is not in the photograph.<br><br>
+      <b>Tier 2 fills those gaps by inventing them.</b> TripoSR generates an
+      object's unseen sides from what it learned across ~800,000 3D models.
+      Plausible, and often convincing — but a guess, not a measurement.<br><br>
+      <b>Scale is ambiguous.</b> Without known camera intrinsics, a small
+      object nearby and a large one far away produce the same photo. The
+      pipeline resolves this by holding one estimated focal length constant
+      across the whole scene, which keeps objects consistent <i>relative to
+      each other</i> without claiming true-to-life measurements.
+    </div>
+    <button id="modal-close">Close</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/DragControls.js"></script>
+<script>
+  const API_BASE = "http://localhost:8000"; // point this at your deployed backend
+
+  const MODES = {
+    object: { endpoint: "/convert",     label: "single object (TripoSR)",       eta: "10–30s" },
+    tier1:  { endpoint: "/scene/tier1", label: "whole-scene mesh",              eta: "20–60s" },
+    tier2:  { endpoint: "/scene/tier2", label: "compositional scene",           eta: "2–10 min" },
+  };
+  let currentMode = "tier1";
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status"), chatListEl = $("chat-list"), fileInput = $("fileInput");
+  const attachBtn = $("attachBtn"), sendBtn = $("sendBtn"), fileNameLabel = $("fileNameLabel");
+  const brightnessSlider = $("brightness");
+  const comparePanel = $("compare-panel"), compareImg = $("compareImg"), compareCaption = $("compareCaption");
+  const statsPanel = $("stats-panel");
+  const downloadBtn = $("downloadBtn"), downloadMenu = $("download-menu");
+  const serverUrlInput = $("serverUrl"), serverDot = $("serverDot");
+  const orientControls = $("orient-controls");
+
+  let currentRecord = null;
+  let wireframeOn = false;
+
+  // ---------------- scene setup ----------------
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0f0f12);
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+  camera.position.set(2, 2, 2);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  // Scene meshes are photo-textured, so colour management actually matters
+  // here in a way it didn't for v1's vertex-coloured single objects —
+  // without this the whole reconstruction renders noticeably washed out.
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  const viewerEl = $("viewer");
+  viewerEl.appendChild(renderer.domElement);
+
+  // Which framing the user last asked for. Photo view derives its FOV from
+  // the viewport aspect ratio, so a resize invalidates it — without
+  // re-applying, "photo view" quietly stops matching the photo.
+  let lastView = "orbit";
+
+  function resizeRenderer() {
+    const w = viewerEl.clientWidth || 1, h = viewerEl.clientHeight || 1;
+    renderer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    if (lastView === "photo") photoView();
+  }
+  window.addEventListener("resize", resizeRenderer);
+
+  const orbitControls = new THREE.OrbitControls(camera, renderer.domElement);
+  orbitControls.enableDamping = true;
+  orbitControls.dampingFactor = 0.08;
+  orbitControls.rotateSpeed = 0.9;
+  orbitControls.zoomSpeed = 0.9;
+  orbitControls.target.set(0, 0, 0);
+
+  renderer.domElement.addEventListener("pointerdown", () => viewerEl.classList.add("grabbing"));
+  window.addEventListener("pointerup", () => viewerEl.classList.remove("grabbing"));
+
+  // ---------------- lighting ----------------
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+  scene.add(ambientLight);
+  const hemiLight = new THREE.HemisphereLight(0xffffff, 0x555566, 0.9);
+  scene.add(hemiLight);
+
+  const rigLights = [[8,0,0],[-8,0,0],[0,8,0],[0,-8,0],[0,0,8],[0,0,-8]].map(([x,y,z]) => {
+    const l = new THREE.DirectionalLight(0xffffff, 0.55);
+    l.position.set(x, y, z);
+    scene.add(l);
+    return l;
+  });
+
+  const pointLight = new THREE.PointLight(0xffffff, 1.8, 20);
+  pointLight.position.set(2, 3, 2);
+  scene.add(pointLight);
+
+  const lightHandle = new THREE.Mesh(
+    new THREE.SphereGeometry(0.08, 16, 16),
+    new THREE.MeshBasicMaterial({ color: 0xffee88 })
+  );
+  lightHandle.position.copy(pointLight.position);
+  scene.add(lightHandle);
+
+  const dragControls = new THREE.DragControls([lightHandle], camera, renderer.domElement);
+  dragControls.addEventListener("dragstart", () => (orbitControls.enabled = false));
+  dragControls.addEventListener("dragend", () => (orbitControls.enabled = true));
+  dragControls.addEventListener("drag", () => pointLight.position.copy(lightHandle.position));
+
+  const baseIntensities = { ambient: 0.5, hemi: 0.9, rig: 0.55, point: 1.8 };
+
+  function applyBrightness(m) {
+    ambientLight.intensity = baseIntensities.ambient * m;
+    hemiLight.intensity = baseIntensities.hemi * m;
+    rigLights.forEach((l) => (l.intensity = baseIntensities.rig * m));
+    pointLight.intensity = baseIntensities.point * m;
+  }
+  applyBrightness(parseFloat(brightnessSlider.value));
+  brightnessSlider.addEventListener("input", () => applyBrightness(parseFloat(brightnessSlider.value)));
+  brightnessSlider.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    let v = parseFloat(brightnessSlider.value) + (e.deltaY < 0 ? 0.1 : -0.1);
+    v = Math.min(3, Math.max(0, v));
+    brightnessSlider.value = v.toFixed(2);
+    applyBrightness(v);
+  });
+
+  // ---------------- model loading ----------------
+  let currentModel = null;
+  let sceneMetrics = null; // { center, size, maxDim, isScene }
+  const gltfLoader = new THREE.GLTFLoader();
+  const orientationSteps = { x: 0, y: 0, z: 0 };
+
+  function isSceneMode(mode) { return mode === "tier1" || mode === "tier2"; }
+
+  function prepareMaterials(root) {
+    root.traverse((child) => {
+      if (!child.isMesh) return;
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((m) => {
+        if (!m) return;
+        // Depth meshes are open surfaces with culled triangles — showing only
+        // front faces makes every gap read as a hole in the reconstruction.
+        m.side = THREE.DoubleSide;
+        m.wireframe = wireframeOn;
+      });
+    });
+  }
+
+  function setWireframe(on) {
+    wireframeOn = on;
+    $("wireBtn").classList.toggle("on", on);
+    if (currentModel) prepareMaterials(currentModel);
+  }
+
+  /**
+   * Frame a freshly loaded model.
+   *
+   * The two modes need genuinely different handling. A single object is
+   * recentred on the origin and orbited around, exactly as in v1. A scene
+   * must NOT be recentred: it is expressed in camera coordinates, with the
+   * camera at the origin looking down -Z, and preserving that is what makes
+   * "photo view" possible at all.
+   */
+  function frameModel() {
+    if (!currentModel) return;
+    const isScene = sceneMetrics && sceneMetrics.isScene;
+
+    if (!isScene) {
+      currentModel.rotation.set(
+        orientationSteps.x * Math.PI / 2,
+        orientationSteps.y * Math.PI / 2,
+        orientationSteps.z * Math.PI / 2
+      );
+      const rotatedCenter = currentModel.userData.centerLocal.clone().applyEuler(currentModel.rotation);
+      currentModel.position.copy(rotatedCenter).negate();
+    }
+
+    const box = new THREE.Box3().setFromObject(currentModel);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    sceneMetrics = { center, size, maxDim, isScene };
+
+    camera.near = maxDim / 500;
+    camera.far = maxDim * 100;
+    orbitControls.minDistance = maxDim * 0.02;
+    orbitControls.maxDistance = maxDim * 12;
+
+    if (isScene) photoView(); else orbitView();
+  }
+
+  /** Camera exactly where the photographer stood: the origin, looking -Z. */
+  function photoView() {
+    if (!sceneMetrics) return;
+    if (!sceneMetrics.isScene) return orbitView();
+    lastView = "photo";
+    const hfov = (currentRecord && currentRecord.stats && findHfov(currentRecord.stats)) || 60;
+    // three.js takes vertical FOV; convert from the horizontal FOV the
+    // reconstruction was built with so the render matches the photo framing.
+    const aspect = camera.aspect || 1;
+    const vfov = 2 * Math.atan(Math.tan((hfov * Math.PI / 180) / 2) / aspect) * 180 / Math.PI;
+    camera.fov = Math.min(Math.max(vfov, 10), 100);
+    camera.position.set(0, 0, 0);
+    orbitControls.target.copy(sceneMetrics.center);
+    camera.updateProjectionMatrix();
+    orbitControls.update();
+    statusEl.textContent = "Photo view — this is the original camera position. Drag to orbit away from it.";
+  }
+
+  function orbitView() {
+    if (!sceneMetrics) return;
+    lastView = "orbit";
+    const { center, maxDim, isScene } = sceneMetrics;
+    camera.fov = 45;
+    const d = maxDim * (isScene ? 1.1 : 2.2);
+    camera.position.set(center.x + d, center.y + d * 0.55, center.z + d);
+    orbitControls.target.copy(isScene ? center : new THREE.Vector3(0, 0, 0));
+    camera.updateProjectionMatrix();
+    orbitControls.update();
+  }
+
+  function findHfov(stats) {
+    if (!stats) return null;
+    if (stats.hfov_deg) return stats.hfov_deg;
+    if (stats.tier1 && stats.tier1.hfov_deg) return stats.tier1.hfov_deg;
+    return null;
+  }
+
+  function loadModelFromUrl(url, record) {
+    statusEl.textContent = "Loading model…";
+    gltfLoader.load(
+      url,
+      (gltf) => {
+        if (currentModel) scene.remove(currentModel);
+        currentModel = gltf.scene;
+        scene.add(currentModel);
+        prepareMaterials(currentModel);
+
+        const box = new THREE.Box3().setFromObject(currentModel);
+        currentModel.userData.centerLocal = box.getCenter(new THREE.Vector3());
+        sceneMetrics = { isScene: isSceneMode(record && record.mode) };
+
+        let meshes = 0, tris = 0;
+        currentModel.traverse((c) => {
+          if (!c.isMesh) return;
+          meshes++;
+          const g = c.geometry;
+          tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
+        });
+
+        frameModel();
+        orientControls.style.display = sceneMetrics.isScene ? "none" : "block";
+        statusEl.textContent =
+          `${meshes} mesh${meshes === 1 ? "" : "es"}, ${Math.round(tris).toLocaleString()} triangles. ` +
+          (sceneMetrics.isScene ? "Photo view — drag to orbit away." : "Drag to rotate, scroll to zoom.");
+      },
+      undefined,
+      (err) => (statusEl.textContent = "Failed to load model: " + (err.message || err))
+    );
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    orbitControls.update();
+    renderer.render(scene, camera);
+  }
+  resizeRenderer();
+  animate();
+
+  // ---------------- stats panel ----------------
+  function row(label, value, warn) {
+    return `<div class="row"><span${warn ? ' class="warn"' : ""}>${label}</span><span>${value}</span></div>`;
+  }
+
+  function renderStats(stats) {
+    if (!stats || !Object.keys(stats).length) {
+      statsPanel.innerHTML = `<div class="grp" style="color:#777">No pipeline stats for this record.</div>`;
+      return;
+    }
+    let html = "";
+    const t1 = stats.tier1 || (stats.mode === "tier1" ? stats : null);
+    if (t1) {
+      html += `<div class="grp"><h4>Tier 1 mesh</h4>`;
+      if (t1.grid) html += row("grid", t1.grid.join(" × "));
+      if (t1.faces != null) html += row("triangles kept", Number(t1.faces).toLocaleString());
+      if (t1.kept_fraction != null) html += row("kept fraction", (t1.kept_fraction * 100).toFixed(1) + "%");
+      if (t1.culled_depth_jump != null) html += row("culled: depth jump", Number(t1.culled_depth_jump).toLocaleString());
+      if (t1.culled_grazing != null) html += row("culled: grazing", Number(t1.culled_grazing).toLocaleString());
+      if (t1.culled_invalid_depth) html += row("culled: bad depth", Number(t1.culled_invalid_depth).toLocaleString());
+      if (t1.depth_range) html += row("depth range", t1.depth_range.map((v) => v.toFixed(2)).join(" – ") + " m");
+      if (t1.hfov_deg) html += row("horizontal FOV", t1.hfov_deg + "°");
+      if (t1.depth_is_metric != null) html += row("metric depth", t1.depth_is_metric ? "yes" : "no (relative)");
+      if (t1.seconds_depth != null) html += row("depth time", t1.seconds_depth + "s");
+      if (t1.seconds_mesh != null) html += row("meshing time", t1.seconds_mesh + "s");
+      html += `</div>`;
+    }
+    if (stats.segmentation) {
+      const s = stats.segmentation;
+      html += `<div class="grp"><h4>Segmentation</h4>` + row("objects kept", s.objects);
+      (s.instances || []).forEach((i) =>
+        (html += row(`#${i.id} area`, `${Number(i.area).toLocaleString()} px @ ${i.depth_median}m`))
+      );
+      html += `</div>`;
+    }
+    if (stats.room_shell) {
+      const r = stats.room_shell;
+      html += `<div class="grp"><h4>Room shell</h4>`;
+      html += row("background points", Number(r.background_points || 0).toLocaleString());
+      html += row("planes fitted", r.planes_found);
+      (r.planes || []).forEach((p) =>
+        (html += row(`${p.kind}`, `${Number(p.inliers).toLocaleString()} pts, rms ${p.rms_error}`))
+      );
+      html += `</div>`;
+    }
+    if (stats.generation) {
+      html += `<div class="grp"><h4>Object generation</h4>`;
+      stats.generation.forEach((g) => {
+        html += g.error
+          ? row(`#${g.instance_id}`, "failed", true)
+          : row(`#${g.instance_id}`, `${Number(g.faces || 0).toLocaleString()} tris, ${g.seconds}s`);
+      });
+      html += `</div>`;
+    }
+    if (stats.placement) {
+      html += `<div class="grp"><h4>Placement</h4>`;
+      stats.placement.forEach((p) => (html += row(`#${p.instance_id}`, `scale ${p.scale}, err ${p.error}`)));
+      html += `</div>`;
+    }
+    if (stats.placement_error) {
+      html += `<div class="grp"><h4>Placement</h4><div class="row warn" style="display:block">${
+        String(stats.placement_error).slice(0, 400)
+      }</div></div>`;
+    }
+    statsPanel.innerHTML = html || `<div class="grp" style="color:#777">Nothing to report.</div>`;
+  }
+
+  $("statsBtn").addEventListener("click", () => {
+    const open = statsPanel.style.display !== "block";
+    statsPanel.style.display = open ? "block" : "none";
+    $("statsBtn").classList.toggle("on", open);
+  });
+
+  // ---------------- preview tabs ----------------
+  const CAPTIONS = {
+    image: "The input photograph.",
+    depth: "Estimated depth — brighter is nearer. Every 3D point comes from this.",
+    overlay: "Instance masks. Each tint is one object sent to per-object generation.",
+  };
+
+  function showPreview(view) {
+    if (!currentRecord) return;
+    const url = { image: currentRecord.image_url, depth: currentRecord.depth_url, overlay: currentRecord.overlay_url }[view];
+    if (!url) return;
+    compareImg.src = API_BASE + url;
+    compareCaption.textContent = CAPTIONS[view];
+    document.querySelectorAll(".cmp-tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
+  }
+
+  document.querySelectorAll(".cmp-tab").forEach((tab) =>
+    tab.addEventListener("click", () => showPreview(tab.dataset.view))
+  );
+
+  function refreshPreviewPanel() {
+    if (!currentRecord) { comparePanel.style.display = "none"; return; }
+    comparePanel.style.display = "block";
+    document.querySelectorAll(".cmp-tab").forEach((t) => {
+      const has = t.dataset.view === "image" ||
+        (t.dataset.view === "depth" && currentRecord.depth_url) ||
+        (t.dataset.view === "overlay" && currentRecord.overlay_url);
+      t.disabled = !has;
+    });
+    showPreview("image");
+  }
+
+  // ---------------- server config ----------------
+  async function refreshServerStatus() {
+    try {
+      const res = await fetch(`${API_BASE}/config`);
+      const cfg = await res.json();
+      serverUrlInput.value = cfg.colab_server_url || "";
+      serverDot.className = cfg.colab_server_url ? (cfg.reachable ? "ok" : "bad") : "";
+      serverDot.title = cfg.reachable ? "Colab server reachable" : `Not reachable: ${cfg.detail}`;
+    } catch (e) {
+      serverDot.className = "bad";
+      serverDot.title = "Backend not reachable at " + API_BASE;
+    }
+  }
+
+  $("serverSave").addEventListener("click", async () => {
+    try {
+      await fetch(`${API_BASE}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ colab_server_url: serverUrlInput.value.trim() }),
+      });
+      await refreshServerStatus();
+      statusEl.textContent = serverDot.className === "ok" ? "Colab server connected." : "Saved, but the server did not answer.";
+    } catch (e) { statusEl.textContent = "Could not save server URL: " + e.message; }
+  });
+  refreshServerStatus();
+  setInterval(refreshServerStatus, 30000);
+
+  // ---------------- mode selector ----------------
+  document.querySelectorAll(".mode-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      currentMode = btn.dataset.mode;
+      document.querySelectorAll(".mode-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      statusEl.textContent = `Mode: ${MODES[currentMode].label} — roughly ${MODES[currentMode].eta}.`;
+    })
+  );
+
+  // ---------------- history sidebar ----------------
+  const formatTime = (iso) => new Date(iso).toLocaleString();
+
+  function addChatItem(record, { pending = false, select = false } = {}) {
+    const item = document.createElement("div");
+    item.className = "chat-item" + (pending ? " pending" : "");
+    item.dataset.id = record.id;
+
+    const img = document.createElement("img");
+    img.src = record.image_url ? API_BASE + record.image_url : record.previewUrl;
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const name = document.createElement("span");
+    name.className = "name";
+    const mode = record.mode || "object";
+    name.innerHTML = `<span class="badge ${mode}">${mode}</span>${record.filename || "image"}`;
+    const time = document.createElement("span");
+    time.textContent = pending ? "Building…" : formatTime(record.timestamp);
+    meta.appendChild(name); meta.appendChild(time);
+    item.appendChild(img); item.appendChild(meta);
+
+    if (!pending) {
+      const del = document.createElement("button");
+      del.className = "delete-btn"; del.textContent = "×"; del.title = "Delete";
+      del.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm("Delete this image and its 3D model?")) return;
+        try {
+          const res = await fetch(`${API_BASE}/history/${record.id}`, { method: "DELETE" });
+          if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+          const wasActive = item.classList.contains("active");
+          item.remove();
+          if (wasActive) {
+            if (currentModel) { scene.remove(currentModel); currentModel = null; }
+            currentRecord = null;
+            comparePanel.style.display = "none";
+            statsPanel.style.display = "none";
+            const next = chatListEl.lastElementChild;
+            if (next) next.click(); else statusEl.textContent = "Pick an image and a mode, then hit Build.";
+          }
+        } catch (err) { statusEl.textContent = "Delete failed: " + err.message; }
+      });
+      item.appendChild(del);
+    }
+
+    item.addEventListener("click", () => {
+      if (pending) return;
+      document.querySelectorAll(".chat-item").forEach((el) => el.classList.remove("active"));
+      item.classList.add("active");
+      currentRecord = record;
+      loadModelFromUrl(API_BASE + record.model_url, record);
+      refreshPreviewPanel();
+      renderStats(record.stats);
+    });
+
+    chatListEl.appendChild(item);
+    chatListEl.scrollTop = chatListEl.scrollHeight;
+    if (select) item.click();
+    return item;
+  }
+
+  async function loadHistory() {
+    try {
+      const res = await fetch(`${API_BASE}/history`);
+      const history = await res.json();
+      chatListEl.innerHTML = "";
+      history.forEach((r) => addChatItem(r));
+      const last = chatListEl.lastElementChild;
+      if (last) last.click();
+    } catch (err) {
+      statusEl.textContent = "Could not reach backend (" + API_BASE + "). Is uvicorn running?";
+    }
+  }
+  loadHistory();
+
+  // ---------------- upload / build ----------------
+  attachBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    fileNameLabel.textContent = fileInput.files[0] ? fileInput.files[0].name : "No image selected";
+  });
+
+  sendBtn.addEventListener("click", async () => {
+    const file = fileInput.files[0];
+    if (!file) { statusEl.textContent = "Choose an image first."; return; }
+
+    const previewUrl = URL.createObjectURL(file);
+    const pending = addChatItem({ id: "pending", filename: file.name, previewUrl, mode: currentMode }, { pending: true });
+
+    const cfg = MODES[currentMode];
+    statusEl.textContent = `Building ${cfg.label}… (${cfg.eta}). Tier 2 runs one generation pass per object, so be patient.`;
+    sendBtn.disabled = true;
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await fetch(`${API_BASE}${cfg.endpoint}`, { method: "POST", body: formData });
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch (e) {}
+        throw new Error(detail);
+      }
+      const record = await res.json();
+      pending.remove();
+      addChatItem(record, { select: true });
+      fileInput.value = "";
+      fileNameLabel.textContent = "No image selected";
+    } catch (err) {
+      statusEl.textContent = "Error: " + err.message;
+      pending.remove();
+    } finally {
+      sendBtn.disabled = false;
+    }
+  });
+
+  // ---------------- view buttons ----------------
+  $("photoViewBtn").addEventListener("click", photoView);
+  $("orbitViewBtn").addEventListener("click", orbitView);
+  $("wireBtn").addEventListener("click", () => setWireframe(!wireframeOn));
+
+  // ---------------- download menu ----------------
+  downloadBtn.addEventListener("click", (e) => { e.stopPropagation(); downloadMenu.classList.toggle("open"); });
+  document.addEventListener("click", () => downloadMenu.classList.remove("open"));
+
+  function triggerDownload(href, filename) {
+    const a = document.createElement("a");
+    a.href = href; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  const stem = () => (currentRecord && currentRecord.filename ? currentRecord.filename.replace(/\.[^.]+$/, "") : "scene");
+
+  $("dlModel").addEventListener("click", () => currentRecord && triggerDownload(API_BASE + currentRecord.model_url, stem() + ".glb"));
+  $("dlImage").addEventListener("click", () => currentRecord && triggerDownload(API_BASE + currentRecord.image_url, currentRecord.filename || "image.png"));
+  $("dlDepth").addEventListener("click", () => {
+    if (!currentRecord || !currentRecord.depth_url) { statusEl.textContent = "No depth map for this record."; return; }
+    triggerDownload(API_BASE + currentRecord.depth_url, stem() + "_depth.png");
+  });
+  $("dlScreenshot").addEventListener("click", () => {
+    renderer.render(scene, camera); // re-render immediately before capture
+    triggerDownload(renderer.domElement.toDataURL("image/png"), stem() + "_view.png");
+  });
+  $("dlStats").addEventListener("click", () => {
+    if (!currentRecord) return;
+    const blob = new Blob([JSON.stringify(currentRecord.stats || {}, null, 2)], { type: "application/json" });
+    triggerDownload(URL.createObjectURL(blob), stem() + "_stats.json");
+  });
+
+  // ---------------- modal ----------------
+  const modalBackdrop = $("modal-backdrop");
+  $("howItWorksBtn").addEventListener("click", () => modalBackdrop.classList.add("open"));
+  $("modal-close").addEventListener("click", () => modalBackdrop.classList.remove("open"));
+  modalBackdrop.addEventListener("click", (e) => { if (e.target === modalBackdrop) modalBackdrop.classList.remove("open"); });
+
+  // ---------------- straighten controls (single-object mode only) ----------------
+  document.querySelectorAll("#orient-buttons button[data-axis]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      orientationSteps[btn.dataset.axis] = (orientationSteps[btn.dataset.axis] + 1) % 4;
+      frameModel();
+    })
+  );
+  $("orientReset").addEventListener("click", () => {
+    orientationSteps.x = orientationSteps.y = orientationSteps.z = 0;
+    frameModel();
+  });
+</script>
+</body>
+</html>

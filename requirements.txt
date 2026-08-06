@@ -1,0 +1,21 @@
+# Pipeline dependencies (pipeline/ package).
+#
+# The geometry layer — camera model, Tier 1 meshing, RANSAC plane fitting,
+# the synthetic test room — needs only the first four and runs fine on a
+# laptop with no GPU. That is deliberate: it means the scripts/selftest_*.py
+# ground-truth checks can be run anywhere, without Colab.
+numpy
+pillow
+trimesh
+scipy
+
+# Edge-preserving depth filtering, mask cleanup, occlusion measurement.
+# Optional — every call site degrades gracefully without it — but the
+# results are noticeably better with it.
+opencv-python-headless
+
+# Only needed to run Depth Anything V2 / SAM2 locally instead of on Colab.
+# The Colab notebook installs its own versions; do not install these on a
+# 4GB-VRAM laptop expecting the large checkpoints to fit.
+# torch
+# transformers
