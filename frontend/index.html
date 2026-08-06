@@ -305,11 +305,27 @@
   // re-applying, "photo view" quietly stops matching the photo.
   let lastView = "orbit";
 
+  /**
+   * Keep the side panels clear of the toolbar.
+   *
+   * The toolbar wraps onto a second row on a narrow viewport, and the panels
+   * were pinned to a fixed `top`, so they ended up underneath it — measured
+   * rather than hard-coded, because the wrap point depends on the button
+   * text and therefore on the browser's font.
+   */
+  function layoutPanels() {
+    const bar = $("topbar").getBoundingClientRect().height;
+    const top = 16 + bar + 10 + "px";
+    comparePanel.style.top = top;
+    statsPanel.style.top = top;
+  }
+
   function resizeRenderer() {
     const w = viewerEl.clientWidth || 1, h = viewerEl.clientHeight || 1;
     renderer.setSize(w, h);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
+    layoutPanels();
     if (lastView === "photo") photoView();
   }
   window.addEventListener("resize", resizeRenderer);
@@ -584,6 +600,7 @@
   $("statsBtn").addEventListener("click", () => {
     const open = statsPanel.style.display !== "block";
     statsPanel.style.display = open ? "block" : "none";
+    layoutPanels();
     $("statsBtn").classList.toggle("on", open);
   });
 
@@ -610,6 +627,7 @@
   function refreshPreviewPanel() {
     if (!currentRecord) { comparePanel.style.display = "none"; return; }
     comparePanel.style.display = "block";
+    layoutPanels();
     document.querySelectorAll(".cmp-tab").forEach((t) => {
       const has = t.dataset.view === "image" ||
         (t.dataset.view === "depth" && currentRecord.depth_url) ||
