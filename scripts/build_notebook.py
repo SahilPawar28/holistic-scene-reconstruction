@@ -38,7 +38,7 @@ one API for `backend/main.py` to call:
 | `POST /segment` | instance masks only (debugging) |
 | `POST /object`  | one pre-cropped object -> mesh (TripoSR) |
 | `POST /tier1`   | whole image -> one continuous scene mesh |
-| `POST /scene`   | Tier 2 compositional scene |
+| `POST /scene`   | Tier 2: shell + placed objects, one .glb |
 
 **One notebook, not two.** Free Colab gives you a single GPU session, so
 Depth Anything V2, SAM2 and TripoSR all live here together. That also means
@@ -120,7 +120,8 @@ print("numpy", numpy.__version__, "| torch", torch.__version__,
 if not torch.cuda.is_available():
     print("WARNING: no GPU. Runtime -> Change runtime type -> T4 GPU.")
 
-from pipeline import camera, depth as depth_mod, meshing, segmentation, room_shell, objects
+from pipeline import (camera, depth as depth_mod, meshing, segmentation,
+                      room_shell, objects, assembly, scene_compose)
 print("pipeline package loaded")
 ''')
 
@@ -170,8 +171,10 @@ import numpy as np
 from PIL import Image
 import trimesh
 
+from pipeline.assembly import PlacementParams, place_objects
 from pipeline.camera import camera_from_image
 from pipeline.meshing import MeshingParams, backproject_mask, depth_to_mesh
+from pipeline.scene_compose import compose_scene, scene_statistics
 from pipeline.room_shell import RansacParams, fit_room_shell
 from pipeline.segmentation import background_mask
 from pipeline.objects import canonicalize_mesh, prepare_crops
@@ -446,23 +449,18 @@ async def scene_endpoint(
     ]
 
     # --- placement + composition -------------------------------------
-    # Implemented in pipeline/assembly.py and pipeline/scene_compose.py.
+    # The core of the project: solve each object's similarity transform
+    # against its own back-projected target cloud, settle it onto whatever
+    # supports it, and assemble everything into one scene graph.
     try:
-        from pipeline.assembly import place_objects
-        from pipeline.scene_compose import compose_scene
-
+        t0 = time.time()
         placements = place_objects(generated, instances, depth_result.depth, cam, shell)
-        scene = compose_scene(shell, generated, placements)
         stats["placement"] = [p.summary() for p in placements]
+        stats["placement_seconds"] = round(time.time() - t0, 2)
+
+        scene = compose_scene(shell, generated, placements)
+        stats["scene"] = scene_statistics(scene, placements)
         glb = glb_b64(scene)
-    except ImportError as exc:
-        stats["placement_error"] = (
-            f"assembly stage not available ({exc}); "
-            "returning the Tier 1 mesh instead"
-        )
-        if include_tier1_fallback not in ("1", "true", "True"):
-            return JSONResponse(status_code=501, content={"detail": stats["placement_error"]})
-        glb = glb_b64(tier1_mesh)
     except Exception:
         stats["placement_error"] = traceback.format_exc(limit=4)
         if include_tier1_fallback not in ("1", "true", "True"):
