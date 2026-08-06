@@ -58,40 +58,54 @@ of paying the load cost per call.
 Free ngrok token: https://dashboard.ngrok.com/get-started/your-authtoken
 """)
 
-code("""
-# --- Cell 1: install. Run this, then Runtime -> Restart session, then
-# --- continue from cell 2. You only ever run this cell once per session.
+code('''
+# --- Cell 1: install EVERYTHING. Run this once, then Runtime -> Restart
+# --- session, then run cell 2 onward. Never re-run this cell afterwards.
+#
+# Three pins in here are load-bearing. Each one was a cryptic failure the
+# first time this notebook was run on a fresh Colab machine, so they are
+# documented rather than left as bare version numbers:
+#
+#   transformers <5   TripoSR's checkpoint stores its DINO image tokenizer
+#                     with the transformers 4.x ViT layer names
+#                     ("encoder.layer.0.attention.attention.query"). v5
+#                     renamed every one of them ("layers.0.attention.q_proj"),
+#                     so loading the checkpoint dies with a wall of
+#                     "Missing key(s) in state_dict" / "Unexpected key(s)".
+#   transformers >=4.45  Depth Anything V2 needs it; older raises
+#                     "KeyError: 'depth_anything'".
+#   numpy ==1.26.4    TripoSR needs numpy<2, and Colab's numba refuses
+#                     anything above 2.0 ("Numba needs NumPy 2.0 or less").
+#
+# ORDER MATTERS. The numpy pin must be the LAST install in this cell —
+# almost every other package will happily pull numpy 2.x back in, and
+# whichever install runs last is the one that wins.
 
-# TripoSR first, because its requirements pin numpy<2 and we want to be the
-# ones who decide the final numpy version, not whatever installs last.
 !git clone -q https://github.com/VAST-AI-Research/TripoSR /content/TripoSR
 !pip install -q -r /content/TripoSR/requirements.txt
-# TripoSR's requirements.txt doesn't pull in onnxruntime, which rembg (used
-# by tsr.system's import chain) needs at import time — without this,
-# "from tsr.system import TSR" fails with ModuleNotFoundError: onnxruntime.
+
+# rembg sits in tsr.system's import chain and needs onnxruntime, which
+# TripoSR's own requirements.txt does not list.
 !pip install -q onnxruntime
 
-# SAM2 (instance segmentation) and Depth Anything V2 (via transformers).
-# Depth Anything V2 support landed in transformers 4.45 — Colab's
-# preinstalled version predates that and raises
-# "KeyError: 'depth_anything'" from AutoModel without this pin.
 !pip install -q "git+https://github.com/facebookresearch/sam2.git"
-!pip install -q "transformers>=4.45.0" accelerate
+!pip install -q "transformers>=4.45,<5" accelerate
 
-# Geometry + serving.
 !pip install -q trimesh scipy opencv-python-headless
 !pip install -q fastapi "uvicorn[standard]" python-multipart pyngrok nest-asyncio
 
-# Same ABI fix as the v1 notebook: TripoSR drags numpy below 2.0, which
-# breaks Colab's preinstalled cupy and scipy (both built against numpy>=2).
-# cupy is unused here so it goes; scipy is needed, so it gets rebuilt to
-# match rather than removed.
+# cupy ships with Colab, is built against numpy 2.x, and is unused here.
 !pip uninstall -y -q cupy-cuda12x
+
+# LAST. See the ORDER MATTERS note above.
 !pip install -q --force-reinstall --no-cache-dir "numpy==1.26.4" scipy
 
-print("Install finished.")
+print("\\nInstall finished. Verifying the pins that actually matter…\\n")
+!python -c "import numpy, transformers; print(f'  numpy        {numpy.__version__}  (need 1.26.x)'); print(f'  transformers {transformers.__version__}  (need >=4.45, <5)')"
+print("\\nIf either line above is wrong, re-run THIS cell only.")
 print("NOW: Runtime -> Restart session, then run cell 2 onward.")
-""")
+print("Do NOT run this cell again after restarting.")
+''')
 
 code('''
 # --- Cell 2: get the pipeline code onto the machine.
@@ -121,9 +135,51 @@ for path in (PROJECT_DIR, "/content/TripoSR"):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-import numpy, torch
-print("numpy", numpy.__version__, "| torch", torch.__version__,
-      "| cuda", torch.cuda.is_available())
+import numpy, torch, transformers
+
+# --- preflight ------------------------------------------------------
+# Every version problem in this stack surfaces late and cryptically: a
+# KeyError from a config mapping, a wall of state_dict key mismatches, an
+# ImportError from numba. All of them are decidable right here, so check
+# them up front and say exactly what to do instead.
+def _version_tuple(text):
+    parts = []
+    for chunk in text.split(".")[:2]:
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+problems = []
+if _version_tuple(numpy.__version__) >= (2, 0):
+    problems.append(
+        f"numpy is {numpy.__version__}, needs 1.26.x — TripoSR and numba both "
+        f"reject numpy 2.x"
+    )
+tf = _version_tuple(transformers.__version__)
+if tf >= (5, 0):
+    problems.append(
+        f"transformers is {transformers.__version__}, needs <5 — v5 renamed the "
+        f"ViT layers, so TripoSR's checkpoint will fail to load with "
+        f"'Missing key(s) in state_dict'"
+    )
+elif tf < (4, 45):
+    problems.append(
+        f"transformers is {transformers.__version__}, needs >=4.45 — older "
+        f"versions raise KeyError: 'depth_anything'"
+    )
+
+if problems:
+    print("ENVIRONMENT IS WRONG:\\n")
+    for p in problems:
+        print("  *", p)
+    print("\\nFix: run this, then Runtime -> Restart session, then re-run")
+    print("this cell (cell 2). Do not re-run cell 1.\\n")
+    print('  !pip install -q "transformers>=4.45,<5"')
+    print('  !pip install -q --force-reinstall --no-cache-dir "numpy==1.26.4" scipy')
+    raise SystemExit("environment check failed — see above")
+
+print("numpy", numpy.__version__, "| transformers", transformers.__version__,
+      "| torch", torch.__version__, "| cuda", torch.cuda.is_available())
 if not torch.cuda.is_available():
     print("WARNING: no GPU. Runtime -> Change runtime type -> T4 GPU.")
 
