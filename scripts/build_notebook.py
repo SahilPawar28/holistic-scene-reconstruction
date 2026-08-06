@@ -557,7 +557,14 @@ print("   ", public_url)
 print("=" * 60)
 print("Leave this cell running. Stopping it stops the server.\\n")
 
-uvicorn.run(app, port=8000, log_level="warning")
+# NOT uvicorn.run() — it calls asyncio.run() internally, which raises
+# "asyncio.run() cannot be called from a running event loop" because the
+# notebook kernel already has one. Driving the Server object directly and
+# awaiting it uses the kernel's existing loop instead. Colab supports
+# top-level await, so this works in a cell.
+config = uvicorn.Config(app, port=8000, log_level="warning")
+server = uvicorn.Server(config)
+await server.serve()
 ''')
 
 
