@@ -170,11 +170,24 @@ def depth_to_mesh(
     depth: np.ndarray,
     camera: PinholeCamera,
     params: MeshingParams | None = None,
+    exclude_mask: np.ndarray | None = None,
 ) -> Tier1Result:
     """Depth map + source image -> one textured trimesh scene mesh.
 
     `camera` must describe the *full-resolution* image; it is rescaled
     internally to whatever grid resolution the mesh ends up at.
+
+    `exclude_mask` drops every triangle touching the masked pixels. Tier 2
+    uses it to build the scene background: the depth mesh with all the
+    object regions cut out, so generated 3D objects can be placed into the
+    holes they left behind.
+
+    That is a more robust background than fitted planes for photos that are
+    not of a room. Plane fitting assumes floors and walls exist; point a
+    camera at a shop shelf or a hand holding a box and RANSAC will still
+    return six planes, but they will be fitted to clutter and render as
+    large floating slabs. A depth mesh always looks like the photograph,
+    because it *is* the photograph.
     """
     import trimesh
 
@@ -211,6 +224,20 @@ def depth_to_mesh(
     finite_vertex = np.isfinite(depth_flat)
     keep = finite_vertex[faces].all(axis=1)
     n_after_finite = int(keep.sum())
+
+    n_after_exclude = n_after_finite
+    if exclude_mask is not None:
+        # NEAREST, not bilinear — resampling a boolean mask with
+        # interpolation blurs its edge and would leave a fringe of
+        # half-excluded triangles around every object.
+        grid_exclude = np.asarray(
+            Image.fromarray((np.asarray(exclude_mask, dtype=bool) * 255).astype(np.uint8))
+            .resize((grid_w, grid_h), Image.NEAREST),
+            dtype=np.uint8,
+        ) > 127
+        excluded_flat = grid_exclude.reshape(-1)
+        keep &= ~excluded_flat[faces].any(axis=1)
+        n_after_exclude = int(keep.sum())
 
     keep &= depth_jump_mask(depth_flat, faces, params.max_relative_depth_jump)
     n_after_jump = int(keep.sum())
@@ -260,7 +287,8 @@ def depth_to_mesh(
         "faces": int(len(faces)),
         "faces_before_culling": int(n_total),
         "culled_invalid_depth": int(n_total - n_after_finite),
-        "culled_depth_jump": int(n_after_finite - n_after_jump),
+        "culled_excluded": int(n_after_finite - n_after_exclude),
+        "culled_depth_jump": int(n_after_exclude - n_after_jump),
         "culled_grazing": int(n_after_jump - n_after_grazing),
         "kept_fraction": round(len(faces) / n_total, 4),
         "depth_range": [

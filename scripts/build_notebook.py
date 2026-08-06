@@ -292,9 +292,9 @@ def run_tier1(image: Image.Image, hfov_deg=60.0, max_grid_side=480,
     return tier1.mesh, stats, depth_png, depth_result, cam
 
 
-def run_segmentation(image: Image.Image, depth_map, max_objects=6):
+def run_segmentation(image: Image.Image, depth_map, max_objects=6, rejections=None):
     segmenter.params.max_instances = int(max_objects)
-    return segmenter.segment(image, depth=depth_map)
+    return segmenter.segment(image, depth=depth_map, rejections=rejections)
 
 
 def mask_overlay(image: Image.Image, instances) -> Image.Image:
@@ -474,6 +474,7 @@ async def scene_endpoint(
     max_objects: int = Form(6),
     plane_threshold: float = Form(0.03),
     include_tier1_fallback: str = Form("1"),
+    background_mode: str = Form("depth"),
 ):
     """Tier 2: room shell + per-object meshes, composed into one scene.
 
@@ -488,13 +489,22 @@ async def scene_endpoint(
     )
     stats["tier1"] = tier1_stats
 
-    instances = run_segmentation(image, depth_result.depth, max_objects)
+    rejected = []
+    instances = run_segmentation(image, depth_result.depth, max_objects,
+                                 rejections=rejected)
     stats["segmentation"] = {
         "objects": len(instances),
         "instances": [
             {"id": i.id, "area": i.area, "bbox": list(i.bbox),
-             "depth_median": round(float(i.depth_median), 3)}
+             "depth_median": round(float(i.depth_median), 3),
+             "relief": round(float(i.meta.get("relative_relief", float("nan"))), 3)}
             for i in instances
+        ],
+        # Why candidates were thrown away. Without this, "the scene came out
+        # empty" or "the scene is full of junk" are both undebuggable.
+        "rejected": [
+            {"area": i.area, "bbox": list(i.bbox), "reason": why}
+            for i, why in rejected[:12]
         ],
     }
     overlay = mask_overlay(image, instances)
@@ -505,6 +515,23 @@ async def scene_endpoint(
     shell = fit_room_shell(bg_cloud, image, cam,
                            RansacParams(distance_threshold=float(plane_threshold)))
     stats["room_shell"] = shell.stats
+
+    # Background geometry. The fitted planes are always computed — the
+    # placement solver needs the floor plane and the up direction — but for
+    # what actually gets rendered, the depth mesh with the object regions
+    # cut out is far more robust on photos that are not of a room.
+    background_geom = None
+    if background_mode in ("depth", "auto"):
+        occupied = ~bg
+        background_geom = depth_to_mesh(
+            image, depth_result.depth, cam,
+            MeshingParams(max_grid_side=480),
+            exclude_mask=occupied,
+        ).mesh
+        stats["background"] = {"mode": "depth-mesh",
+                               "faces": int(len(background_geom.faces))}
+    else:
+        stats["background"] = {"mode": "fitted-planes"}
 
     generated = generate_object_meshes(image, instances, depth_result.depth)
     stats["generation"] = [
@@ -521,7 +548,8 @@ async def scene_endpoint(
         stats["placement"] = [p.summary() for p in placements]
         stats["placement_seconds"] = round(time.time() - t0, 2)
 
-        scene = compose_scene(shell, generated, placements)
+        scene = compose_scene(shell, generated, placements,
+                              background_mesh=background_geom)
         stats["scene"] = scene_statistics(scene, placements)
         glb = glb_b64(scene)
     except Exception:

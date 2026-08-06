@@ -25,6 +25,7 @@ def compose_scene(
     placements: list[Placement],
     include_shell: bool = True,
     include_failed: bool = False,
+    background_mesh=None,
 ):
     """Room shell + placed object meshes -> one `trimesh.Scene`.
 
@@ -38,8 +39,16 @@ def compose_scene(
     meshes = {g.instance_id: g.mesh for g in generated}
     placed = 0
 
-    if include_shell and shell is not None and shell.mesh is not None:
-        scene.add_geometry(shell.mesh, node_name="room_shell", geom_name="room_shell")
+    # A supplied background mesh (the depth mesh with object regions cut
+    # out) replaces the fitted-plane shell. The shell's *planes* are still
+    # used for support snapping either way — this only changes what gets
+    # rendered, not what the solver reasons about.
+    shell_geom = background_mesh
+    if shell_geom is None and shell is not None:
+        shell_geom = shell.mesh
+    if include_shell and shell_geom is not None:
+        name = "background" if background_mesh is not None else "room_shell"
+        scene.add_geometry(shell_geom, node_name=name, geom_name=name)
 
     for placement in placements:
         mesh = meshes.get(placement.instance_id)
@@ -54,7 +63,7 @@ def compose_scene(
         )
         placed += 1
 
-    if placed == 0 and (shell is None or shell.mesh is None):
+    if placed == 0 and shell_geom is None:
         raise RuntimeError(
             "nothing to compose: no room shell and no successfully placed objects"
         )
