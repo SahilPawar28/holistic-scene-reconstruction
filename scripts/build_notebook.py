@@ -66,6 +66,10 @@ code("""
 # ones who decide the final numpy version, not whatever installs last.
 !git clone -q https://github.com/VAST-AI-Research/TripoSR /content/TripoSR
 !pip install -q -r /content/TripoSR/requirements.txt
+# TripoSR's requirements.txt doesn't pull in onnxruntime, which rembg (used
+# by tsr.system's import chain) needs at import time — without this,
+# "from tsr.system import TSR" fails with ModuleNotFoundError: onnxruntime.
+!pip install -q onnxruntime
 
 # SAM2 (instance segmentation) and Depth Anything V2 (via transformers).
 # Depth Anything V2 support landed in transformers 4.45 — Colab's
