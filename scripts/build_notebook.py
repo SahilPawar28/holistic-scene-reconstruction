@@ -117,23 +117,44 @@ code('''
 REPO_URL = ""   # e.g. "https://github.com/<you>/holistic-scene-reconstruction"
 PROJECT_DIR = "/content/holistic-scene-reconstruction"
 
-import os, sys, subprocess
+import os, sys, shutil, subprocess
+
+# Getting stale code onto the GPU box is the single most expensive mistake
+# available here: everything runs, nothing errors, and you spend an evening
+# debugging results produced by a version you already fixed. So this cell
+# refuses to be quiet about which code it actually loaded.
+if os.path.isdir(PROJECT_DIR) and not os.path.isdir(os.path.join(PROJECT_DIR, ".git")):
+    # Uploaded as a zip rather than cloned. `git pull` would fail silently
+    # here and leave the old files in place, which is exactly what happened.
+    if REPO_URL:
+        print(f"{PROJECT_DIR} is not a git checkout — replacing it with a fresh clone.")
+        shutil.rmtree(PROJECT_DIR)
+    else:
+        print("WARNING: not a git checkout and no REPO_URL set — this code can")
+        print("         only be updated by re-uploading the zip. If you have")
+        print("         changed anything since the upload, re-upload it now.")
 
 if not os.path.isdir(PROJECT_DIR):
-    if REPO_URL:
-        subprocess.run(["git", "clone", "-q", REPO_URL, PROJECT_DIR], check=True)
-    else:
+    if not REPO_URL:
         raise SystemExit(
             "Set REPO_URL above, or upload the project folder to "
             f"{PROJECT_DIR} (Files pane -> upload, or mount Drive)."
         )
-else:
-    # Already present — pull so a re-run picks up local edits.
+    subprocess.run(["git", "clone", "-q", REPO_URL, PROJECT_DIR], check=True)
+elif os.path.isdir(os.path.join(PROJECT_DIR, ".git")):
+    subprocess.run(["git", "-C", PROJECT_DIR, "fetch", "-q", "origin"], check=False)
+    subprocess.run(["git", "-C", PROJECT_DIR, "reset", "--hard", "-q",
+                    "origin/HEAD"], check=False)
     subprocess.run(["git", "-C", PROJECT_DIR, "pull", "-q"], check=False)
 
 for path in (PROJECT_DIR, "/content/TripoSR"):
     if path not in sys.path:
         sys.path.insert(0, path)
+
+# Drop any already-imported copy, so re-running this cell after a pull
+# actually picks the new files up instead of the cached modules.
+for name in [m for m in sys.modules if m == "pipeline" or m.startswith("pipeline.")]:
+    del sys.modules[name]
 
 import numpy, torch, transformers
 
@@ -185,7 +206,27 @@ if not torch.cuda.is_available():
 
 from pipeline import (camera, depth as depth_mod, meshing, segmentation,
                       room_shell, objects, assembly, scene_compose)
-print("pipeline package loaded")
+
+# Version marker. Checking for a symbol that only exists in the current
+# code is the only reliable way to know the pull worked — a stale copy
+# imports perfectly happily and just behaves like the old version.
+_missing = [
+    name for name, present in [
+        ("segmentation.looks_like_object", hasattr(segmentation, "looks_like_object")),
+        ("meshing.depth_to_mesh(exclude_mask=)",
+         "exclude_mask" in meshing.depth_to_mesh.__code__.co_varnames),
+        ("assembly.place_objects", hasattr(assembly, "place_objects")),
+    ] if not present
+]
+if _missing:
+    print("STALE PIPELINE CODE — missing:", ", ".join(_missing))
+    print("The copy at", PROJECT_DIR, "is out of date. Set REPO_URL above and")
+    print("re-run this cell, or delete that folder and re-upload the zip.")
+    raise SystemExit("stale pipeline code — see above")
+
+_rev = subprocess.run(["git", "-C", PROJECT_DIR, "log", "-1", "--format=%h %ad %s",
+                       "--date=short"], capture_output=True, text=True)
+print("pipeline loaded:", (_rev.stdout or "(not a git checkout)").strip()[:90])
 ''')
 
 code('''

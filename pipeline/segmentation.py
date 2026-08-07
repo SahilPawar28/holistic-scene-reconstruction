@@ -123,8 +123,21 @@ class SegmentationParams:
 
     # Cap on how many objects go to per-object 3D generation. Each one is a
     # separate TripoSR call, so this is a wall-clock budget as much as a
-    # quality filter. Kept objects are the largest ones.
+    # quality filter.
     max_instances: int = 8
+
+    # How to rank when more candidates survive than max_instances allows.
+    #
+    # "area" keeps the biggest, which is wrong for the photos people
+    # actually take. A close-up of a coffee cup on a cafe table has a
+    # subject occupying maybe 15% of the frame, while the table, the chair
+    # behind it and a stranger's jeans are all larger. Ranking by area sends
+    # the jeans to TripoSR and drops the cup.
+    #
+    # "objectness" ranks by how much a candidate behaves like the subject of
+    # the photograph: standing out in depth, reasonably large, and near the
+    # middle of the frame. People centre what they are photographing.
+    rank_by: str = "objectness"
 
     sam_points_per_side: int = 24
     sam_pred_iou_thresh: float = 0.8
@@ -280,6 +293,37 @@ def looks_like_object(
     return True, ""
 
 
+def objectness(instance: Instance) -> float:
+    """How much does this look like the thing the photo is *of*?
+
+    Three signals multiplied together, each in [0, 1]-ish:
+
+      relief      how far it stands out in depth from its surroundings
+      size        sqrt of area fraction — bigger is more likely the subject,
+                  but sub-linearly, so a huge background region cannot win
+                  on size alone
+      centrality  people frame their subject near the middle
+
+    Used only to rank candidates that have already passed every filter, so
+    it decides which survivors get a TripoSR call, not what counts as an
+    object at all.
+    """
+    relief = instance.meta.get("relative_relief")
+    if relief is None or not np.isfinite(relief):
+        relief = 0.05          # unknown: neutral, don't zero the whole score
+    relief = float(np.clip(relief, 0.0, 1.0))
+
+    size = float(np.sqrt(np.clip(instance.area_fraction, 0.0, 1.0)))
+
+    h, w = instance.mask.shape[:2]
+    x0, y0, x1, y1 = instance.bbox
+    dx = ((x0 + x1) / 2.0 - w / 2.0) / max(w, 1)
+    dy = ((y0 + y1) / 2.0 - h / 2.0) / max(h, 1)
+    centrality = float(np.clip(1.0 - 2.0 * np.hypot(dx, dy), 0.0, 1.0))
+
+    return relief * size * (0.4 + 0.6 * centrality)
+
+
 def attach_depth_stats(instances: list[Instance], depth: np.ndarray) -> None:
     """Fill in each instance's depth statistics, in place."""
     for inst in instances:
@@ -379,7 +423,17 @@ def filter_instances(
         if not redundant:
             survivors.append(inst)
 
-    survivors = survivors[: params.max_instances]
+    if params.rank_by == "objectness":
+        for inst in survivors:
+            inst.meta["objectness"] = objectness(inst)
+        ranked = sorted(survivors, key=lambda i: i.meta["objectness"], reverse=True)
+    else:
+        ranked = sorted(survivors, key=lambda i: i.area, reverse=True)
+
+    for inst in ranked[params.max_instances:]:
+        rejections.append((inst, "ranked below the cap on objects to generate"))
+    survivors = ranked[: params.max_instances]
+
     for new_id, inst in enumerate(survivors):
         inst.id = new_id
     return survivors
