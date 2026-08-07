@@ -439,6 +439,38 @@ def filter_instances(
     return survivors
 
 
+def occupancy_mask(
+    instances: list[Instance], shape: tuple[int, int], grow_px: int = 0
+) -> np.ndarray:
+    """Union of the instance masks, optionally grown or shrunk.
+
+    `grow_px` is signed, and the sign matters depending on what the mask is
+    for. Growing (positive) is right when excluding object pixels from a
+    plane-fitting cloud: segmentation boundaries sit slightly inside the true
+    silhouette, so a halo of object-edge pixels would otherwise leak in at
+    object depth and drag the fit.
+
+    Shrinking (negative) is right when cutting the object's hole out of the
+    background mesh. The generated mesh that fills that hole never matches
+    the silhouette exactly, so a hole cut flush — let alone dilated — leaves
+    a black rim around every object. Cutting slightly inside lets the placed
+    mesh cover the seam.
+    """
+    h, w = shape
+    occupied = np.zeros((h, w), dtype=bool)
+    for inst in instances:
+        occupied |= inst.mask
+    if grow_px == 0:
+        return occupied
+    try:
+        import cv2
+    except ImportError:
+        return occupied
+    k = np.ones((abs(grow_px) * 2 + 1,) * 2, np.uint8)
+    op = cv2.dilate if grow_px > 0 else cv2.erode
+    return op(occupied.astype(np.uint8), k, iterations=1).astype(bool)
+
+
 def background_mask(
     instances: list[Instance], shape: tuple[int, int], dilate_px: int = 3
 ) -> np.ndarray:

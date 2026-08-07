@@ -277,12 +277,13 @@ import numpy as np
 from PIL import Image
 import trimesh
 
-from pipeline.assembly import PlacementParams, place_objects
+from pipeline.assembly import (PlacementParams, kept_instance_ids,
+                               place_objects)
 from pipeline.camera import camera_from_image
 from pipeline.meshing import MeshingParams, backproject_mask, depth_to_mesh
 from pipeline.scene_compose import compose_scene, scene_statistics
 from pipeline.room_shell import RansacParams, fit_room_shell
-from pipeline.segmentation import background_mask
+from pipeline.segmentation import background_mask, occupancy_mask
 from pipeline.objects import canonicalize_mesh, prepare_crops
 
 
@@ -559,22 +560,6 @@ async def scene_endpoint(
                            RansacParams(distance_threshold=float(plane_threshold)))
     stats["room_shell"] = shell.stats
 
-    # Background geometry. The fitted planes are always computed — the
-    # placement solver needs the floor plane and the up direction — but for
-    # what actually gets rendered, the depth mesh with the object regions
-    # cut out is far more robust on photos that are not of a room.
-    background_geom = None
-    if background_mode in ("depth", "auto"):
-        occupied = ~bg
-        background_geom = depth_to_mesh(
-            image, depth_result.depth, cam,
-            MeshingParams(max_grid_side=480),
-            exclude_mask=occupied,
-        ).mesh
-        stats["background"] = {"mode": "depth-mesh",
-                               "faces": int(len(background_geom.faces))}
-    else:
-        stats["background"] = {"mode": "fitted-planes"}
 
     generated = generate_object_meshes(image, instances, depth_result.depth)
     stats["generation"] = [
@@ -590,6 +575,38 @@ async def scene_endpoint(
         placements = place_objects(generated, instances, depth_result.depth, cam, shell)
         stats["placement"] = [p.summary() for p in placements]
         stats["placement_seconds"] = round(time.time() - t0, 2)
+
+        # Background geometry is built AFTER the quality gate, and only
+        # objects that survived it get their pixels cut out. A rejected
+        # object leaves no hole, so the photograph shows through where it
+        # would have been — strictly better than a hole with a blob in it.
+        kept_ids = kept_instance_ids(placements)
+        kept_instances = [i for i in instances if i.id in kept_ids]
+        stats["quality_gate"] = {
+            "kept": sorted(kept_ids),
+            "rejected": [
+                {"instance_id": p.instance_id, "reason": p.status,
+                 "coverage": round(float(p.coverage), 3)}
+                for p in placements if not p.ok
+            ],
+        }
+
+        background_geom = None
+        if background_mode in ("depth", "auto"):
+            # Shrunk slightly: the generated mesh never matches the
+            # silhouette exactly, and a flush cut leaves a black rim.
+            occupied = occupancy_mask(kept_instances, depth_result.depth.shape,
+                                      grow_px=-2)
+            background_geom = depth_to_mesh(
+                image, depth_result.depth, cam,
+                MeshingParams(max_grid_side=480),
+                exclude_mask=occupied,
+            ).mesh
+            stats["background"] = {"mode": "depth-mesh",
+                                   "faces": int(len(background_geom.faces)),
+                                   "holes_cut_for": sorted(kept_ids)}
+        else:
+            stats["background"] = {"mode": "fitted-planes"}
 
         scene = compose_scene(shell, generated, placements,
                               background_mesh=background_geom)

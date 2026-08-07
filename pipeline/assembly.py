@@ -174,6 +174,17 @@ class PlacementParams:
     # correction, decided by a fit-quality-weighted vote. See place_objects.
     orientation_consensus: bool = True
 
+    # Quality gate. Coverage is the fraction of the object's observed points
+    # the placed mesh actually explains; below roughly half, the generated
+    # mesh is not that object's shape and no transform will make it one.
+    #
+    # Showing such an object is strictly worse than showing nothing: the
+    # viewer gets a blob AND loses the photo-accurate background pixels that
+    # were cut away to make room for it. Dropping it puts the photograph
+    # back. This is the cheapest large improvement available on real scenes.
+    min_coverage: float = 0.6
+    max_rms_error: float = 0.25   # metres; a fit this loose is meaningless
+
     snap_to_support: bool = True
     # Only snap when the correction is small. A big correction means the
     # solver and the support disagree substantially, and overriding a
@@ -1009,5 +1020,24 @@ def place_objects(
                     redone.seed_index = winner
                     placements[placements.index(p)] = redone
 
+    # --- quality gate ---------------------------------------------------
+    for p in placements:
+        if not p.ok:
+            continue
+        if params.min_coverage > 0 and p.coverage < params.min_coverage:
+            p.status = f"rejected:low-coverage {p.coverage:.2f}"
+        elif np.isfinite(p.rms_error) and p.rms_error > params.max_rms_error:
+            p.status = f"rejected:poor-fit {p.rms_error:.2f}m"
+
     snap_placements_to_supports(placements, meshes, floor, up, params)
     return placements
+
+
+def kept_instance_ids(placements: list[Placement]) -> set[int]:
+    """Instances that survived placement and the quality gate.
+
+    Only these should have their pixels cut out of the background mesh —
+    a rejected object leaves no hole, so the photograph shows through where
+    it would have been.
+    """
+    return {p.instance_id for p in placements if p.ok}
