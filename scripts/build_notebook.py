@@ -114,7 +114,9 @@ code('''
 # pasted into the notebook, so the same code that the ground-truth self-tests
 # exercise locally is the code that runs on the GPU here.
 
-REPO_URL = ""   # e.g. "https://github.com/<you>/holistic-scene-reconstruction"
+# Pre-filled so this notebook needs no editing — open it straight from
+# GitHub and run. Change it only if you fork the repo.
+REPO_URL = "https://github.com/SahilPawar28/holistic-scene-reconstruction"
 PROJECT_DIR = "/content/holistic-scene-reconstruction"
 
 import os, sys, shutil, subprocess
