@@ -116,11 +116,21 @@ class PlacementParams:
     max_target_points: int = 6000
 
     # --- rotation ---
-    # "yaw"   — rotate about the up axis only. Almost everything in a room
-    #           stands upright, and 1 DOF is far more stable from one view.
-    # "full"  — unconstrained 3-DOF rotation (Umeyama).
-    # "fixed" — never rotate; use the initial guess.
-    rotation_mode: str = "yaw"
+    # "upright" — try all 24 axis-aligned orientations as seeds, then refine
+    #             yaw from the best. This is the default because TripoSR does
+    #             NOT emit upright meshes: its output carries a fixed axis
+    #             tilt (the v1 viewer shipped manual "straighten" buttons to
+    #             work around it). Pure yaw refinement can never undo a tilt,
+    #             so every object came out lying at whatever angle the
+    #             generator chose. Seeding from the axis-aligned set lets the
+    #             solver *discover* that convention from the data instead of
+    #             hard-coding a rotation that may change with the model.
+    # "yaw"     — rotate about the up axis only, no tilt correction. Correct
+    #             when the mesh is already upright.
+    # "full"    — unconstrained 3-DOF rotation (Umeyama). Most flexible,
+    #             least stable from a single view.
+    # "fixed"   — never rotate; use the initial guess.
+    rotation_mode: str = "upright"
     yaw_starts: int = 12             # multi-start seeds around the up axis
     yaw_screen_iterations: int = 5   # cheap screening pass before committing
     yaw_finalists: int = 2
@@ -160,6 +170,10 @@ class PlacementParams:
     max_scale_prior: float = 0.45
 
     # --- support snapping ---
+    # Force every object in a scene to share one frame-convention
+    # correction, decided by a fit-quality-weighted vote. See place_objects.
+    orientation_consensus: bool = True
+
     snap_to_support: bool = True
     # Only snap when the correction is small. A big correction means the
     # solver and the support disagree substantially, and overriding a
@@ -187,6 +201,7 @@ class Placement:
     support: str = "none"             # floor | object:N | none
     snap_offset: float = 0.0
     scale_prior_weight: float = 0.0   # how much the mask prior was trusted
+    seed_index: int = -1              # which axis-aligned orientation won
     status: str = "ok"                # ok | failed:<reason>
 
     @property
@@ -222,6 +237,7 @@ class Placement:
             "support": self.support,
             "snap_offset": round(float(self.snap_offset), 4),
             "scale_prior_weight": round(float(self.scale_prior_weight), 3),
+            "seed_index": int(self.seed_index),
             "iterations": self.iterations,
             "target_points": self.n_target_points,
             "occlusion": round(float(self.occlusion), 3),
@@ -343,6 +359,32 @@ def solve_similarity_yaw(src: np.ndarray, dst: np.ndarray, up: np.ndarray):
     if not np.isfinite(s) or s <= 1e-9:
         s = 1.0
     return s, rotation, dst_mean - s * (rotation @ src_mean)
+
+
+def axis_aligned_rotations() -> list[np.ndarray]:
+    """The 24 rotations that map the coordinate axes onto themselves.
+
+    Signed permutation matrices with determinant +1 — the rotation group of
+    a cube. Used as orientation seeds: whatever fixed frame convention a
+    generative model uses, the rotation that undoes it is almost always one
+    of these (models are trained on upright, axis-aligned assets), and
+    checking all 24 is cheap compared to being wrong.
+
+    Determinant +1 matters. The other 24 signed permutations are
+    reflections, and seeding with one produces a mirrored object that then
+    fits its own mirror image plausibly well.
+    """
+    import itertools
+
+    mats = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1.0, -1.0), repeat=3):
+            m = np.zeros((3, 3))
+            for row, col in enumerate(perm):
+                m[row, col] = signs[row]
+            if abs(np.linalg.det(m) - 1.0) < 1e-9:
+                mats.append(m)
+    return mats
 
 
 def rotation_about_axis(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -574,8 +616,14 @@ def solve_placement(
     params: PlacementParams | None = None,
     instance_id: int = 0,
     occlusion: float = 0.0,
+    orientation_seed: np.ndarray | None = None,
 ) -> Placement:
-    """Solve one object's placement against its target cloud."""
+    """Solve one object's placement against its target cloud.
+
+    `orientation_seed` pins the frame-convention correction instead of
+    searching for it, which is how the scene-level consensus pass forces a
+    stubborn object into line with the rest.
+    """
     params = params or PlacementParams()
     rng = np.random.default_rng(params.seed + instance_id)
 
@@ -629,38 +677,58 @@ def solve_placement(
     # so several yaw seeds are screened cheaply and the best few run to
     # convergence. Committing to one seed is how this stage silently returns
     # objects facing the wrong way.
-    seeds = [np.eye(3)]
-    if params.rotation_mode in ("yaw", "full") and params.yaw_starts > 1:
-        seeds += [
-            rotation_about_axis(up, 2 * math.pi * k / params.yaw_starts)
-            for k in range(1, params.yaw_starts)
-        ]
+    if params.rotation_mode == "upright":
+        # Each seed is a candidate fix for the generator's frame convention;
+        # yaw is then solved *within* that frame, so the object stays
+        # upright relative to whichever seed wins.
+        seeds = ([np.asarray(orientation_seed, dtype=np.float64)]
+                 if orientation_seed is not None else axis_aligned_rotations())
+        inner_mode = "yaw"
+    else:
+        seeds = [np.eye(3)]
+        if params.rotation_mode in ("yaw", "full") and params.yaw_starts > 1:
+            seeds += [
+                rotation_about_axis(up, 2 * math.pi * k / params.yaw_starts)
+                for k in range(1, params.yaw_starts)
+            ]
+        inner_mode = params.rotation_mode
+
+    def run(seed, start_s, start_r, start_t, iterations):
+        """ICP in the frame defined by `seed`.
+
+        Rotating the canonical points by the seed up front means the inner
+        solve never has to know about seeds at all — the composed rotation
+        is simply (solved @ seed).
+        """
+        seeded = canonical @ seed.T
+        seeded_normals = None if normals is None else normals @ seed.T
+        out = _icp(
+            seeded, seeded_normals, target_pts, camera,
+            start_s, start_r, start_t, up,
+            mode=inner_mode, iterations=iterations,
+            scale_range=scale_range, params=params,
+        )
+        return out
 
     screened = []
-    for seed_rotation in seeds:
-        cand = _icp(
-            canonical, normals, target_pts, camera,
-            s1, seed_rotation @ r1, t1, up,
-            mode=params.rotation_mode,
-            iterations=params.yaw_screen_iterations,
-            scale_range=scale_range, params=params,
-        )
-        screened.append(cand)
+    for seed in seeds:
+        cand = run(seed, s1, np.eye(3), t1, params.yaw_screen_iterations)
+        screened.append((cand, seed))
 
-    screened.sort(key=lambda c: _score(c[3], c[4]))
-    best = (s1, r1, t1, rms1, cov1, it1)
+    screened.sort(key=lambda cs: _score(cs[0][3], cs[0][4]))
+    best, best_seed = (s1, np.eye(3), t1, rms1, cov1, it1), r1
 
-    for cand in screened[: max(1, params.yaw_finalists)]:
-        refined = _icp(
-            canonical, normals, target_pts, camera,
-            cand[0], cand[1], cand[2], up,
-            mode=params.rotation_mode, iterations=params.phase2_iterations,
-            scale_range=scale_range, params=params,
-        )
+    for cand, seed in screened[: max(1, params.yaw_finalists)]:
+        refined = run(seed, cand[0], cand[1], cand[2], params.phase2_iterations)
         if _score(refined[3], refined[4]) < _score(best[3], best[4]):
-            best = refined
+            best, best_seed = refined, seed
 
-    result.scale, result.rotation, result.translation = best[0], best[1], best[2]
+    result.scale = best[0]
+    result.rotation = best[1] @ best_seed   # undo the frame, then orient
+    result.translation = best[2]
+    result.seed_index = next(
+        (i for i, sd in enumerate(seeds) if np.allclose(sd, best_seed)), -1
+    )
     result.rms_error, result.coverage = best[3], best[4]
     result.iterations = it1 + best[5]
 
@@ -893,6 +961,53 @@ def place_objects(
         )
         placements.append(placement)
         meshes[item.instance_id] = item.mesh
+
+    # --- scene-level orientation consensus -----------------------------
+    # The generator's frame convention is a property of the *model*, not of
+    # any one object, so every object in a scene shares the same tilt. But
+    # solving it per object lets ambiguous ones disagree: a table cut off by
+    # the frame edge fits its own 90-degree-rotated self about as well as
+    # the correct pose, and comes out lying on its side next to correctly
+    # oriented neighbours.
+    #
+    # So take a vote. Objects that fitted confidently (high coverage, low
+    # error) carry more weight, and anything that disagrees with the
+    # consensus is re-solved with the winning orientation pinned. One
+    # well-observed object is enough to rescue several ambiguous ones.
+    if params.rotation_mode == "upright" and params.orientation_consensus:
+        seeds = axis_aligned_rotations()
+        votes: dict[int, float] = {}
+        for p in placements:
+            if not p.ok or p.seed_index < 0:
+                continue
+            weight = p.coverage / max(p.rms_error, 1e-3)
+            votes[p.seed_index] = votes.get(p.seed_index, 0.0) + weight
+
+        if votes:
+            winner = max(votes, key=votes.get)
+            for p in placements:
+                if not p.ok or p.seed_index == winner or p.seed_index < 0:
+                    continue
+                instance = by_id.get(p.instance_id)
+                mesh = meshes.get(p.instance_id)
+                if instance is None or mesh is None:
+                    continue
+                target = backproject_mask(
+                    instance.mask, depth, camera,
+                    max_points=params.max_target_points * 3,
+                )
+                redone = solve_placement(
+                    mesh, target, camera,
+                    initial_scale=initial_scale_from_mask(instance, depth, camera),
+                    up=up, params=params, instance_id=p.instance_id,
+                    occlusion=measure_occlusion(instance, depth),
+                    orientation_seed=seeds[winner],
+                )
+                if redone.ok:
+                    # Report the consensus seed, not index 0 of the
+                    # single-element forced list.
+                    redone.seed_index = winner
+                    placements[placements.index(p)] = redone
 
     snap_placements_to_supports(placements, meshes, floor, up, params)
     return placements
