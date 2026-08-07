@@ -265,6 +265,14 @@ triposr.renderer.set_chunk_size(8192)
 triposr.to(DEVICE)
 print("TripoSR ready")
 
+# 4) CLIP for semantic labelling of segments. ~350MB, and it replaces a
+#    stack of geometric heuristics that could only ever approximate
+#    "is this region an object or part of the room".
+from pipeline.semantic import SemanticLabeler
+
+labeler = SemanticLabeler(device=DEVICE).load()
+print("semantic labeller ready:", labeler.params.checkpoint)
+
 gc.collect(); torch.cuda.empty_cache()
 print("VRAM used: %.2f GB" % (torch.cuda.memory_allocated() / 1e9 if DEVICE == "cuda" else 0))
 ''')
@@ -336,9 +344,32 @@ def run_tier1(image: Image.Image, hfov_deg=60.0, max_grid_side=480,
     return tier1.mesh, stats, depth_png, depth_result, cam
 
 
-def run_segmentation(image: Image.Image, depth_map, max_objects=6, rejections=None):
+def run_segmentation(image: Image.Image, depth_map, max_objects=6,
+                     rejections=None, use_semantics=True):
+    """SAM2 -> CLIP labelling -> filtering.
+
+    Labelling happens between the two so semantics can drive the filter:
+    the raw masks are annotated first, then `filter_instances` lets a
+    confident "this is a wall" override the geometric heuristics.
+    """
     segmenter.params.max_instances = int(max_objects)
-    return segmenter.segment(image, depth=depth_map, rejections=rejections)
+    raw = segmenter.raw_masks(image)
+    instances = []
+    for i, m in enumerate(raw):
+        mask = segmentation.clean_mask(np.asarray(m["segmentation"], dtype=bool))
+        area = int(np.count_nonzero(mask))
+        if area == 0:
+            continue
+        instances.append(segmentation.Instance(
+            id=i, mask=mask, bbox=segmentation.mask_to_bbox(mask), area=area,
+            score=float(m.get("predicted_iou", 1.0))))
+
+    if use_semantics and instances:
+        labeler.annotate(image, instances)
+
+    segmentation.attach_depth_stats(instances, depth_map)
+    return segmentation.filter_instances(
+        instances, depth=depth_map, params=segmenter.params, rejections=rejections)
 
 
 def mask_overlay(image: Image.Image, instances) -> Image.Image:
@@ -541,7 +572,10 @@ async def scene_endpoint(
         "instances": [
             {"id": i.id, "area": i.area, "bbox": list(i.bbox),
              "depth_median": round(float(i.depth_median), 3),
-             "relief": round(float(i.meta.get("relative_relief", float("nan"))), 3)}
+             "relief": round(float(i.meta.get("relative_relief", float("nan"))), 3),
+             "label": i.meta.get("semantic_label"),
+             "category": i.meta.get("semantic_category"),
+             "confidence": i.meta.get("semantic_confidence")}
             for i in instances
         ],
         # Why candidates were thrown away. Without this, "the scene came out
@@ -563,7 +597,12 @@ async def scene_endpoint(
 
     generated = generate_object_meshes(image, instances, depth_result.depth)
     stats["generation"] = [
-        {"instance_id": g.instance_id, **g.meta} for g in generated
+        {"instance_id": g.instance_id,
+         "label": g.crop.meta.get("semantic_label"),
+         "crop_quality": g.crop.meta.get("crop_quality"),
+         "crop_warnings": g.crop.meta.get("crop_warnings"),
+         **g.meta}
+        for g in generated
     ]
 
     # --- placement + composition -------------------------------------

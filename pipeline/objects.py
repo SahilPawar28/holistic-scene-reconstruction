@@ -38,6 +38,7 @@ import numpy as np
 from PIL import Image
 
 from .camera import PinholeCamera
+from .enhance import enhance as enhance_image, measure_quality
 from .segmentation import Instance
 
 # Fraction of the square crop that the object should span. TripoSR's
@@ -145,6 +146,7 @@ def prepare_crop(
     output_size: int = 512,
     foreground_fraction: float = FOREGROUND_FRACTION,
     feather_px: int = 2,
+    enhance_crop: bool = True,
 ) -> ObjectCrop:
     """Cut one object out of the photo and frame it the way TripoSR wants.
 
@@ -201,7 +203,22 @@ def prepare_crop(
     canvas = Image.new("RGB", (box[2] - box[0], box[3] - box[1]),
                        (BACKGROUND_GREY,) * 3)
     canvas.paste(full.crop(box), (0, 0))
+    native_px = box[2] - box[0]
     square = canvas.resize((output_size, output_size), Image.LANCZOS)
+
+    # Enhance after the resize, not before: the resize is what costs
+    # acutance, and CLAHE on the pre-resize crop then gets softened away.
+    quality = measure_quality(native_px, output_size, square)
+    if enhance_crop:
+        # The flat grey background must not be enhanced — CLAHE would
+        # stretch its noise into banding, which the generator reads as
+        # geometry. Protect everything outside the object.
+        bg_region = np.asarray(
+            Image.fromarray((alpha > 0.5).astype(np.uint8) * 255).crop(box).resize(
+                (output_size, output_size), Image.NEAREST
+            )
+        ) > 127
+        square = enhance_image(square, protect_mask=bg_region)
 
     rgba_canvas = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]), (0, 0, 0, 0))
     rgba_canvas.paste(rgba_full.crop(box), (0, 0))
@@ -216,7 +233,12 @@ def prepare_crop(
         occlusion=measure_occlusion(instance, depth),
         mask_pixels=instance.area,
         label=instance.label,
-        meta={"depth_median": instance.depth_median},
+        meta={
+            "depth_median": instance.depth_median,
+            "crop_quality": quality.summary(),
+            "crop_warnings": quality.warnings(),
+            "semantic_label": instance.meta.get("semantic_label"),
+        },
     )
 
 
@@ -225,8 +247,12 @@ def prepare_crops(
     instances: list[Instance],
     depth: np.ndarray | None = None,
     output_size: int = 512,
+    enhance_crop: bool = True,
 ) -> list[ObjectCrop]:
-    return [prepare_crop(image, i, depth, output_size) for i in instances]
+    return [
+        prepare_crop(image, i, depth, output_size, enhance_crop=enhance_crop)
+        for i in instances
+    ]
 
 
 def canonicalize_mesh(mesh, target_extent: float = 1.0):

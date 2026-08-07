@@ -265,7 +265,23 @@ def looks_like_object(
     depth: np.ndarray | None,
     params: SegmentationParams,
 ) -> tuple[bool, str]:
-    """Positive test for objecthood. Returns (keep, reason_if_rejected)."""
+    """Positive test for objecthood. Returns (keep, reason_if_rejected).
+
+    When a semantic label is available and confident it takes precedence
+    over the geometric tests, because it is simply better information: depth
+    relief and compactness are proxies for "is this a thing", whereas a
+    model that has seen sofas can answer directly. The geometric tests stay
+    as the fallback for regions the labeller is unsure about, and the
+    frame-span test still applies either way — a mask covering the whole
+    frame is not a placeable object however sofa-like it looks.
+    """
+    category = instance.meta.get("semantic_category")
+    trusted = instance.meta.get("semantic_trusted")
+    label = instance.meta.get("semantic_label", category)
+
+    if trusted and category in ("structure", "person"):
+        return False, f"recognised as {label!r} ({category}), not an object"
+
     edges = border_edge_count(instance)
     if edges > params.max_border_edges:
         return False, f"spans {edges} frame edges"
@@ -277,6 +293,11 @@ def looks_like_object(
     ar = aspect_ratio(instance)
     if ar > params.max_aspect_ratio:
         return False, f"aspect ratio {ar:.1f} (strip-like)"
+
+    if trusted and category == "object":
+        # Recognised as a real object: skip the geometric proxies, which
+        # exist only to approximate this decision.
+        return True, ""
 
     if depth is not None:
         relief = depth_relief(instance.mask, depth, params.relief_ring_px)
