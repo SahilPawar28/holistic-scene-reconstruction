@@ -366,6 +366,28 @@ async def convert(file: UploadFile = File(...)):
                    {"model_url": f"/files/models/{model_name}"})
 
 
+@app.post("/convert/triposg")
+async def convert_triposg(file: UploadFile = File(...)):
+    """Single object -> mesh via TripoSG, for direct comparison against
+    /convert (TripoSR) on the identical photo.
+
+    A standalone generator test, not part of the Tier 1/2/3 pipeline — the
+    point is to see TripoSG's output on a few basic objects before deciding
+    whether it's worth swapping into the real pipeline anywhere. Colab
+    reports 503 if TripoSG failed to load in that session; every other mode
+    keeps working either way.
+    """
+    record_id, image_name, image_path = _save_upload(file)
+    resp = _post_to_colab("/object/triposg", image_path, {}, TIMEOUTS["convert"])
+
+    model_name = f"{record_id}.glb"
+    with open(os.path.join(MODELS_DIR, model_name), "wb") as f:
+        f.write(resp.content)
+
+    return _record(record_id, "triposg", file.filename, image_name,
+                   {"model_url": f"/files/models/{model_name}"})
+
+
 @app.post("/scene/tier1")
 async def scene_tier1(
     file: UploadFile = File(...),

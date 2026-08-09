@@ -40,6 +40,7 @@
   .badge.tier1 { background: #204a3a; color: #7fe0b0; }
   .badge.tier2 { background: #2b2a5c; color: #a9b4ff; }
   .badge.stepwise { background: #3a2a5c; color: #d1a9ff; }
+  .badge.triposg { background: #4a3320; color: #ffb870; }
   .delete-btn { background: none; border: none; color: #666; font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px; line-height: 1; }
   .delete-btn:hover { background: #3a2222; color: #ff6b6b; }
 
@@ -170,6 +171,7 @@
       <button class="mode-btn active" data-mode="tier1"><b>Tier 1</b>whole scene</button>
       <button class="mode-btn" data-mode="tier2"><b>Tier 2</b>compositional</button>
       <button class="mode-btn" data-mode="stepwise"><b>Stepwise</b>see every stage</button>
+      <button class="mode-btn" data-mode="triposg"><b>TripoSG</b>test generator</button>
     </div>
 
     <div id="chat-list"></div>
@@ -316,6 +318,12 @@
     tier1:  { endpoint: "/scene/tier1", label: "whole-scene mesh",              eta: "20–60s" },
     tier2:  { endpoint: "/scene/tier2", label: "compositional scene",           eta: "2–10 min" },
     stepwise: { endpoint: "/scene/stepwise", label: "every pipeline stage, inspectable", eta: "3–12 min" },
+    // Standalone generator comparison, not part of the Tier 1/2/3 pipeline —
+    // same one-object-in-one-mesh-out contract as "Object" mode, but through
+    // TripoSG instead of TripoSR, so the two can be judged on identical
+    // input. If TripoSG failed to load in the current Colab session this
+    // 503s with a clear message; every other mode is unaffected.
+    triposg: { endpoint: "/convert/triposg", label: "TripoSG (experimental generator test)", eta: "20–90s" },
   };
   let currentMode = "tier1";
 

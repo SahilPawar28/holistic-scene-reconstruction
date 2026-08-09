@@ -1,0 +1,56 @@
+Add TripoSG generator test section (standalone, not wired into any tier)
+
+New "TripoSG" mode button, same contract as "Object" mode (one photo in,
+one mesh out) but through TripoSG instead of TripoSR -- lets the two be
+compared on identical input before deciding whether TripoSG is worth
+swapping into Tier 3's generator.
+
+Picked over InstantMesh / TRELLIS / Stable Fast 3D after checking actual
+dependency profiles, not just marketing copy:
+
+  - InstantMesh needs nvdiffrast built from source, and its
+    requirements.txt pins transformers==4.34.1 -- installing it in the
+    same Colab session would silently break Depth Anything V2, CLIP and
+    GroundingDINO, which all need transformers>=4.45,<5. A hard conflict,
+    not just friction.
+  - TRELLIS (what SceneGen is built on, evaluated earlier) needs kaolin,
+    diffoctreerast and spconv -- all CUDA-compiled, the category of
+    dependency that has caused most of the install pain in this project so
+    far.
+  - TripoSG (VAST-AI-Research, same lab as TripoSR) has no CUDA-compiled
+    extensions and its own requirements.txt does not pin transformers or
+    diffusers at all, so it cannot downgrade anything already loaded.
+
+Confirmed the real Python API (TripoSGPipeline, BriaRMBG background
+removal, the exact inference call and output format) from VAST-AI-Research's
+own inference script rather than guessing it.
+
+Colab (scripts/build_notebook.py): new isolated cell 3B loads TripoSG
+after every other model, wrapped in try/except so a failure leaves
+triposg_pipe as None and every earlier model (and Tier 1/2/3, Stepwise)
+completely unaffected. Installs TripoSG's dependencies package-by-package
+rather than via its requirements.txt, because that file pins
+numpy==1.22.3 -- which would fight the numpy==1.26.4 pin already settled
+on for TripoSR/numba. New /object/triposg endpoint mirrors /object
+exactly; returns 503 with a clear message (not a crash) if TripoSG failed
+to load that session. /health now reports TripoSG's checkpoint and lists
+the route only when it actually loaded.
+
+Backend: /convert/triposg proxies to it, identical shape to /convert.
+
+Frontend: new mode button, orange badge. isSceneMode() already treats
+"triposg" as a single-object mode by default (only tier1/tier2/stepwise
+are scene modes), so it gets the same orbit framing and straighten
+controls as "Object" mode with no extra code. Verified in a live browser
+with a seeded fake record: badge renders, mesh loads with correct
+single-object framing, no console errors; delete endpoint cleans it up
+correctly.
+
+Honest status: the notebook cell itself is UNVERIFIED -- I cannot run a
+GPU from here. Everything that can be checked without one has been:
+syntax, the real upstream API, dependency conflicts, the full request/
+response path end to end with a stand-in mesh. The one open question is
+whether TripoSG's own install actually succeeds on a fresh Colab T4,
+which only running cell 3B will answer.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

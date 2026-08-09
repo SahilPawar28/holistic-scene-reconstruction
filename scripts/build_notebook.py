@@ -309,6 +309,73 @@ print("VRAM used: %.2f GB" % (torch.cuda.memory_allocated() / 1e9 if DEVICE == "
 ''')
 
 code('''
+# --- Cell 3B (optional): TripoSG, a candidate replacement generator.
+#
+# NOT wired into Tier 1/2/3 or Stepwise -- this loads alongside the existing
+# models purely so its output can be compared against TripoSR's on the same
+# test photos before deciding whether to swap it in anywhere. If this cell
+# fails, nothing else in the notebook is affected: every model above it
+# already finished loading, and the /object/triposg endpoint checks whether
+# triposg_pipe actually loaded before using it.
+#
+# Picked over InstantMesh / TRELLIS / Stable Fast 3D specifically because it
+# has no custom CUDA-compiled extensions to build (no nvdiffrast / kaolin /
+# diffoctreerast -- the category of dependency that makes an install
+# genuinely fragile on a fresh Colab machine, as opposed to merely annoying)
+# and its own requirements.txt does not pin transformers or diffusers, so it
+# cannot silently downgrade the versions Depth Anything V2, CLIP and
+# GroundingDINO above it already depend on. InstantMesh, by contrast, pins
+# transformers==4.34.1 -- installing it in this same session would break
+# every model already loaded above.
+
+triposg_pipe = None
+triposg_rmbg = None
+
+try:
+    import subprocess as _sp
+
+    TRIPOSG_DIR = "/content/TripoSG"
+    if not os.path.isdir(TRIPOSG_DIR):
+        _sp.run(["git", "clone", "-q",
+                "https://github.com/VAST-AI-Research/TripoSG", TRIPOSG_DIR],
+               check=True)
+
+    # Installed package-by-package rather than via
+    # `pip install -r requirements.txt`: that file pins numpy==1.22.3, which
+    # would fight the numpy==1.26.4 pin cell 1 already settled on for
+    # TripoSR/numba. Everything else in it is unpinned, so this keeps our
+    # numpy version and only pulls in what TripoSG needs beyond what every
+    # earlier cell already installed.
+    for _pkg in ["pymeshlab", "diso", "jaxtyping", "typeguard", "peft", "xatlas"]:
+        _sp.run([sys.executable, "-m", "pip", "install", "-q", _pkg], check=False)
+
+    if TRIPOSG_DIR not in sys.path:
+        sys.path.insert(0, TRIPOSG_DIR)
+
+    from triposg.pipelines.pipeline_triposg import TripoSGPipeline
+    from briarmbg import BriaRMBG
+    from huggingface_hub import snapshot_download
+
+    triposg_weights = snapshot_download("VAST-AI/TripoSG")
+    rmbg_weights = snapshot_download("briaai/RMBG-1.4")
+
+    triposg_rmbg = BriaRMBG.from_pretrained(rmbg_weights).to(DEVICE).eval()
+    triposg_pipe = TripoSGPipeline.from_pretrained(triposg_weights).to(
+        DEVICE, torch.float16 if DEVICE == "cuda" else torch.float32
+    )
+    print("TripoSG ready (experimental -- not yet wired into any tier)")
+except Exception as _exc:
+    print(f"TripoSG failed to load, skipping it: {type(_exc).__name__}: {_exc}")
+    print("Everything else in this notebook (Tier 1/2/3, Stepwise) is unaffected.")
+    triposg_pipe = None
+    triposg_rmbg = None
+
+gc.collect()
+if DEVICE == "cuda":
+    torch.cuda.empty_cache()
+''')
+
+code('''
 # --- Cell 4: the pipeline stages, wired together.
 
 import base64, io, json, time
@@ -572,13 +639,42 @@ def generate_object_meshes(image, instances, depth_map, resolution=256, crops=No
     return generated
 
 
+def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, seed=0):
+    """One image -> one mesh via TripoSG. Deliberately mirrors /object's
+    contract (TripoSR) exactly, so the two can be compared on the identical
+    input photo rather than on different framing or preprocessing.
+
+    Uses TripoSG's own background-removal net (BriaRMBG) rather than one of
+    our SAM2 masks -- this endpoint is a standalone single-photo test of the
+    generator itself (parity with how a user tests "Object" mode today), not
+    yet part of the segmented multi-object pipeline.
+    """
+    if triposg_pipe is None:
+        raise RuntimeError("TripoSG did not load in this session — see cell 3B's output")
+    from image_process import prepare_image
+
+    prepared = prepare_image(
+        image.convert("RGB"), bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=triposg_rmbg
+    )
+    with torch.no_grad():
+        out = triposg_pipe(
+            image=prepared,
+            generator=torch.Generator(device=triposg_pipe.device).manual_seed(int(seed)),
+            num_inference_steps=int(num_inference_steps),
+            guidance_scale=float(guidance_scale),
+        ).samples[0]
+    mesh = trimesh.Trimesh(out[0].astype(np.float32), np.ascontiguousarray(out[1]))
+    torch.cuda.empty_cache()
+    return mesh
+
+
 print("pipeline stages defined")
 ''')
 
 code('''
 # --- Cell 5: the API server.
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import uuid, os, io, traceback
@@ -597,16 +693,16 @@ async def read_image(file: UploadFile) -> Image.Image:
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "device": DEVICE,
-        "models": {
-            "depth": depth_model.checkpoint,
-            "segmentation": segmenter.checkpoint,
-            "generation": "stabilityai/TripoSR",
-        },
-        "endpoints": ["/depth", "/segment", "/object", "/tier1", "/scene", "/scene/stepwise"],
+    endpoints = ["/depth", "/segment", "/object", "/tier1", "/scene", "/scene/stepwise"]
+    models = {
+        "depth": depth_model.checkpoint,
+        "segmentation": segmenter.checkpoint,
+        "generation": "stabilityai/TripoSR",
     }
+    if triposg_pipe is not None:
+        models["generation_experimental"] = "VAST-AI/TripoSG"
+        endpoints.append("/object/triposg")
+    return {"status": "ok", "device": DEVICE, "models": models, "endpoints": endpoints}
 
 
 @app.post("/depth")
@@ -966,6 +1062,34 @@ async def scene_stepwise_endpoint(
               type="glb", glb_base64=glb_b64(scene))
 
     return {"stages": stages, "stats": json_safe(stats)}
+
+
+@app.post("/object/triposg")
+async def object_triposg_endpoint(
+    file: UploadFile = File(...),
+    num_inference_steps: int = Form(24),
+    guidance_scale: float = Form(7.0),
+):
+    """Single object -> mesh via TripoSG, for direct comparison against
+    /object (TripoSR) on the identical photo. A standalone generator test,
+    not part of the Tier 1/2/3 pipeline — see the module docstring on
+    cell 3B for why TripoSG specifically, and what happens if it failed
+    to load in this session.
+    """
+    if triposg_pipe is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "TripoSG did not load in this Colab session (see cell 3B's "
+                "output for why). TripoSR-based modes are unaffected — "
+                "try Object/Tier 1/Tier 2/Stepwise instead."
+            ),
+        )
+    image = await read_image(file)
+    mesh = generate_triposg_mesh(image, num_inference_steps, guidance_scale)
+    path = f"{OUT_DIR}/{uuid.uuid4()}.glb"
+    mesh.export(path)
+    return FileResponse(path, media_type="model/gltf-binary", filename="object.glb")
 
 
 print("server defined —", len(app.routes), "routes")
