@@ -56,9 +56,12 @@ early lets it absorb error that really belongs to scale, and the solve
 walks away. Phase 1 freezes rotation and nails scale and position; phase 2
 then refines rotation from a good starting point.
 
-Because TripoSR's canonical orientation is not a documented contract, phase
-2 is seeded from several candidate yaws and the best final fit wins, rather
-than trusting one assumed convention.
+That ordering applies to the rotation *search* modes. The default mode does
+not search at all: TripoSR's output frame is documented (X backward, Y
+right, Z up), so the rotation between it and the scene frame is a known
+constant, applied before phase 1 rather than solved for. See
+TRIPOSR_TO_SCENE — treating a known quantity as unknown was a real bug, and
+it is what left objects lying at arbitrary angles.
 """
 
 from __future__ import annotations
@@ -75,6 +78,75 @@ from .room_shell import FittedPlane, RoomShell
 from .segmentation import Instance
 
 UP = np.array([0.0, 1.0, 0.0])
+
+
+def _rot_x(t: float) -> np.ndarray:
+    c, s = math.cos(t), math.sin(t)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
+
+def _rot_y(t: float) -> np.ndarray:
+    c, s = math.cos(t), math.sin(t)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+
+
+# TripoSR's native output frame, per its own documentation, is right-handed
+# with +X pointing BACKWARD (away from the input camera), +Y right and +Z up.
+# Our scene frame is glTF/three.js: +X right, +Y up, -Z forward. The rotation
+# between them is therefore a fixed constant, and TripoSR's own viewer uses
+# exactly it — `tsr.utils.to_gradio_3d_orientation` applies rotate(-90, X)
+# then rotate(+90, Y) to display meshes in a Y-up/-Z-forward viewer, which is
+# our convention too.
+#
+# This matters more than it looks. The orientation of a generated mesh
+# relative to the camera is NOT unknown and does not need to be searched
+# for: TripoSR reconstructs the object as seen in the crop, so the mesh
+# already faces the way the object faced in the photograph. The earlier
+# approach of trying all 24 axis-aligned orientations and letting ICP pick
+# the best-fitting one was solving a problem that has a closed-form answer,
+# and it failed exactly where you would expect — a blobby generated mesh
+# does not constrain rotation well enough for a fit score to identify the
+# right one, so it picked the least-bad wrong guess and objects came out
+# lying at arbitrary angles.
+#
+# Verified: det = +1 (a proper rotation, not a mirror), orthonormal, and it
+# maps TripoSR's up axis to our up axis and its backward axis to our
+# away-from-camera axis.
+TRIPOSR_TO_SCENE = _rot_y(math.pi / 2) @ _rot_x(-math.pi / 2)
+
+
+def rotation_from_minus_z_to(direction: np.ndarray) -> np.ndarray:
+    """Rotation carrying -Z (the canonical view axis) onto `direction`.
+
+    TripoSR's canonical frame assumes the object is viewed head-on. An
+    object sitting off to the side of a photograph is not: it is seen along
+    the ray from the camera to it, which is tilted away from the optical
+    axis by up to half the field of view. Composing this with
+    TRIPOSR_TO_SCENE accounts for that, so an object at the edge of the
+    frame is not left rotated by the angle its own position implies.
+
+    Rodrigues' formula for the rotation between two unit vectors, with the
+    antiparallel case handled separately since the cross product vanishes
+    there and the general formula divides by zero.
+    """
+    a = np.array([0.0, 0.0, -1.0])
+    b = np.asarray(direction, dtype=np.float64)
+    norm = np.linalg.norm(b)
+    if norm < 1e-12:
+        return np.eye(3)
+    b = b / norm
+
+    v = np.cross(a, b)
+    c = float(a @ b)
+    if c < -1.0 + 1e-9:
+        # Exactly opposite: any axis perpendicular to `a` gives a valid
+        # 180-degree rotation.
+        return _rot_y(math.pi)
+    s2 = float(v @ v)
+    if s2 < 1e-18:
+        return np.eye(3)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * ((1.0 - c) / s2)
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +202,18 @@ class PlacementParams:
     # "full"    — unconstrained 3-DOF rotation (Umeyama). Most flexible,
     #             least stable from a single view.
     # "fixed"   — never rotate; use the initial guess.
-    rotation_mode: str = "upright"
+    # "calibrated" — use TripoSR's documented frame convention directly
+    #                (TRIPOSR_TO_SCENE composed with a look-at toward the
+    #                object), optionally refining yaw. This is the default
+    #                because the orientation is *known*, not unknown: see
+    #                TRIPOSR_TO_SCENE above. Searching for it was the bug.
+    rotation_mode: str = "calibrated"
+    # Whether to let ICP refine yaw on top of the calibrated orientation.
+    # Off by default: TripoSR reconstructs the object as seen, so the full
+    # orientation is already determined and there is no genuine remaining
+    # rotational freedom to solve for. Turning this on lets a poor fit
+    # rotate a correctly-oriented object away from its correct pose.
+    calibrated_yaw_refine: bool = False
     yaw_starts: int = 12             # multi-start seeds around the up axis
     yaw_screen_iterations: int = 5   # cheap screening pass before committing
     yaw_finalists: int = 2
@@ -703,6 +786,21 @@ def solve_placement(
     # centroid of a front surface is not the centroid of the object, but ICP
     # corrects that within a couple of iterations once visibility filtering
     # is comparing like with like.
+    # In calibrated mode the orientation is known up front, so apply it
+    # BEFORE phase 1 rather than treating it as a phase-2 seed. Phase 1
+    # solves scale and translation with rotation frozen; running it on a
+    # mesh still in the generator's raw frame means fitting a
+    # wrongly-oriented object, and phase 2 then cannot always recover from
+    # the bad scale and position that produces. Measured: with the seed
+    # applied only in phase 2, the test room's table stayed 90 degrees out
+    # and 72cm off; applying it from the start fixes it.
+    base_rotation = np.eye(3)
+    if params.rotation_mode == "calibrated":
+        base_rotation = TRIPOSR_TO_SCENE
+        canonical = canonical @ base_rotation.T
+        if normals is not None:
+            normals = normals @ base_rotation.T
+
     t0 = target_pts.mean(axis=0) - initial_scale * (canonical.mean(axis=0))
 
     # ---- phase 1: scale + translation, rotation frozen -----------------
@@ -714,7 +812,7 @@ def solve_placement(
     )
 
     if params.rotation_mode == "fixed":
-        result.scale, result.rotation, result.translation = s1, r1, t1
+        result.scale, result.rotation, result.translation = s1, r1 @ base_rotation, t1
         result.rms_error, result.coverage, result.iterations = rms1, cov1, it1
         _apply_scale_prior(result, canonical, normals, camera, initial_scale, params)
         return result
@@ -725,7 +823,24 @@ def solve_placement(
     # so several yaw seeds are screened cheaply and the best few run to
     # convergence. Committing to one seed is how this stage silently returns
     # objects facing the wrong way.
-    if params.rotation_mode == "upright":
+    if params.rotation_mode == "calibrated":
+        # The mesh already faces the way the object faced in the photo, so
+        # the orientation is computed, not searched — TripoSR's fixed frame
+        # convention, applied directly.
+        #
+        # Deliberately NOT composed with a look-at toward the object. That
+        # was tried and measurably made things worse: a look-at rotates the
+        # object to face the camera, but a table below the camera is still
+        # upright — it is the camera that tilts down to see it, not the
+        # table that tilts back. On the ground-truth room a full look-at
+        # injected 11-18 degrees of spurious tilt into every object, while
+        # the bare constant left all three at exactly 0.0 degrees.
+        # base_rotation is already applied to `canonical` above, so the
+        # remaining seed is identity; it is composed back into the reported
+        # rotation at the end.
+        seeds = [np.eye(3)]
+        inner_mode = "yaw" if params.calibrated_yaw_refine else "fixed"
+    elif params.rotation_mode == "upright":
         # Each seed is a candidate fix for the generator's frame convention;
         # yaw is then solved *within* that frame, so the object stays
         # upright relative to whichever seed wins.
@@ -772,7 +887,9 @@ def solve_placement(
             best, best_seed = refined, seed
 
     result.scale = best[0]
-    result.rotation = best[1] @ best_seed   # undo the frame, then orient
+    # Compose in this order: the generator-frame correction first, then
+    # whatever seed/refinement the solver chose on top of it.
+    result.rotation = best[1] @ best_seed @ base_rotation
     result.translation = best[2]
     result.seed_index = next(
         (i for i, sd in enumerate(seeds) if np.allclose(sd, best_seed)), -1

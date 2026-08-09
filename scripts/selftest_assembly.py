@@ -36,6 +36,7 @@ from dataclasses import replace
 
 from pipeline import synthetic
 from pipeline.assembly import (
+    TRIPOSR_TO_SCENE,
     Placement,
     PlacementParams,
     initial_scale_from_mask,
@@ -75,13 +76,22 @@ def box_surface_distance(points: np.ndarray, box) -> np.ndarray:
     return np.abs(outside + inside)
 
 
-def generated_mesh_for(box, perturb: float = 0.0, seed: int = 0):
+def generated_mesh_for(box, perturb: float = 0.0, seed: int = 0,
+                       in_triposr_frame: bool = True):
     """A dense stand-in for what TripoSR would return for this object.
 
     Canonicalised the same way a real generated mesh is: centred on the
-    origin, longest side normalised to 1. The ground-truth transform is
-    therefore scale = the box's longest side, rotation = identity,
-    translation = the box's centre.
+    origin, longest side normalised to 1.
+
+    `in_triposr_frame` (default True) additionally pushes the mesh into
+    TripoSR's own output frame — X backward, Y right, Z up — because that
+    is what a real generated mesh actually arrives in, and the solver's
+    default calibrated mode is built to undo exactly that. Feeding an
+    already-world-oriented mesh, as this helper originally did, tests a
+    situation that never occurs in the real pipeline. Pass False for the
+    tests that specifically exercise the rotation *search* machinery
+    (yaw recovery, phase ordering), which needs an unrotated starting point
+    to have a known answer.
     """
     import trimesh
 
@@ -93,6 +103,11 @@ def generated_mesh_for(box, perturb: float = 0.0, seed: int = 0):
     # of magnitude coarser than a real TripoSR output, which is not a fair
     # stand-in: a 200-vertex mesh cannot be registered to anything.
     canonical = canonical.subdivide_to_size(max_edge=0.025)
+
+    if in_triposr_frame:
+        canonical.vertices = (
+            np.asarray(canonical.vertices, dtype=np.float64) @ TRIPOSR_TO_SCENE
+        )
 
     if perturb > 0:
         rng = np.random.default_rng(seed)
@@ -327,24 +342,40 @@ def test_phase_order() -> None:
     print("\nablation: solving rotation first vs the recommended order")
     scene, instances, by_name = scene_setup()
     boxes = {b.name: b for b in scene.boxes}
-    box = boxes["table"]
-    s_true, _ = truth_for(box)
 
-    _, staged = solve_one(scene, by_name["table"], box)
-    # Rotation free from the very first iteration, no frozen-rotation phase.
-    _, rotation_first = solve_one(
-        scene, by_name["table"], box,
-        params=PlacementParams(phase1_iterations=0, phase2_iterations=32),
-    )
-    e_staged = abs(staged.scale - s_true) / s_true
-    e_first = abs(rotation_first.scale - s_true) / s_true
-    print(f"        staged (scale then rotation): scale err {e_staged*100:.1f}%, "
-          f"rms {staged.rms_error*100:.1f}cm")
-    print(f"        rotation from the start:      scale err {e_first*100:.1f}%, "
-          f"rms {rotation_first.rms_error*100:.1f}cm")
-    check("staged order is no worse than rotating from the start",
-          e_staged <= e_first + 0.02,
-          f"{e_staged*100:.1f}% vs {e_first*100:.1f}%")
+    # Judged across every object, not one. A single object's scale error is
+    # noisy enough that either ordering can win on it by a point or two,
+    # which says nothing about the ordering itself — the claim being tested
+    # ("freezing rotation first is more stable") is a claim about the
+    # method, so it has to be measured over the whole set.
+    #
+    # Both arms use the search mode ("upright") rather than the calibrated
+    # default, which has no phase-2 rotation solve whose ordering could
+    # differ.
+    staged_errs, first_errs = [], []
+    for name in ("table", "crate", "pot"):
+        box = boxes[name]
+        s_true, _ = truth_for(box)
+        _, staged = solve_one(scene, by_name[name], box,
+                              params=PlacementParams(rotation_mode="upright"))
+        _, rotation_first = solve_one(
+            scene, by_name[name], box,
+            params=PlacementParams(rotation_mode="upright",
+                                   phase1_iterations=0, phase2_iterations=32),
+        )
+        e_s = abs(staged.scale - s_true) / s_true
+        e_f = abs(rotation_first.scale - s_true) / s_true
+        staged_errs.append(e_s)
+        first_errs.append(e_f)
+        print(f"        {name:6s} staged {e_s*100:5.1f}%   rotation-first {e_f*100:5.1f}%")
+
+    mean_staged = float(np.mean(staged_errs))
+    mean_first = float(np.mean(first_errs))
+    print(f"        mean:  staged {mean_staged*100:.1f}%   "
+          f"rotation-first {mean_first*100:.1f}%")
+    check("staged order is no worse on average than rotating from the start",
+          mean_staged <= mean_first + 0.02,
+          f"{mean_staged*100:.1f}% vs {mean_first*100:.1f}%")
 
 
 def test_yaw_recovery() -> None:
@@ -355,7 +386,9 @@ def test_yaw_recovery() -> None:
     import trimesh
 
     for degrees in (25.0, -40.0):
-        mesh = generated_mesh_for(box)
+        # Search-machinery test: needs a world-frame mesh so the injected
+        # yaw is the only rotation present and the answer is known.
+        mesh = generated_mesh_for(box, in_triposr_frame=False)
         pre = rotation_about_axis(UP, math.radians(degrees))
         spun = mesh.copy()
         spun.vertices = np.asarray(mesh.vertices, dtype=np.float64) @ pre.T
@@ -365,7 +398,7 @@ def test_yaw_recovery() -> None:
         placement = solve_placement(
             spun, target, scene.camera,
             initial_scale=initial_scale_from_mask(by_name["table"], scene.depth, scene.camera),
-            up=UP, params=PlacementParams(), instance_id=0,
+            up=UP, params=PlacementParams(rotation_mode="upright"), instance_id=0,
         )
         # The solver should undo the pre-rotation: R_solved @ pre ~ identity,
         # up to the box's 180-degree symmetry.

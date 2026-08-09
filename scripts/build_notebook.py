@@ -234,6 +234,8 @@ _missing = [
         ("pipeline.detection", _has_module("pipeline.detection")),
         ("segmentation.merge_instances", hasattr(segmentation, "merge_instances")),
         ("assembly.resolve_overlaps", hasattr(assembly, "resolve_overlaps")),
+        ("assembly.TRIPOSR_TO_SCENE (calibrated orientation)",
+         hasattr(assembly, "TRIPOSR_TO_SCENE")),
         ("assembly gate v2 (0.45 relief)",
          hasattr(assembly, "PlacementParams")
          and assembly.PlacementParams().semantic_gate_relief >= 0.45),
