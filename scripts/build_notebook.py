@@ -295,6 +295,29 @@ from pipeline.segmentation import background_mask, occupancy_mask
 from pipeline.objects import canonicalize_mesh, prepare_crops
 
 
+def json_safe(value):
+    """Strip NaN/Inf so FastAPI can serialise the stats.
+
+    JSON has no representation for NaN, and json.dumps raises rather than
+    emitting one — so a single unmeasurable statistic buried anywhere in the
+    stats tree takes down the whole response and the user gets no scene at
+    all. Several fields are legitimately NaN (depth relief with too few
+    pixels, RMS error on a failed fit), so they are converted to null here
+    once, centrally, instead of being guarded at every site that writes one.
+    """
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
 def to_b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -489,7 +512,7 @@ async def segment_endpoint(file: UploadFile = File(...), hfov_deg: float = Form(
     instances = run_segmentation(image, result.depth, max_objects)
     return {
         "overlay_png_base64": png_b64(mask_overlay(image, instances)),
-        "stats": {
+        "stats": json_safe({
             "objects": len(instances),
             "instances": [
                 {"id": i.id, "area": i.area, "area_fraction": round(i.area_fraction, 4),
@@ -497,7 +520,7 @@ async def segment_endpoint(file: UploadFile = File(...), hfov_deg: float = Form(
                  "depth_median": round(float(i.depth_median), 3)}
                 for i in instances
             ],
-        },
+        }),
     }
 
 
@@ -539,7 +562,7 @@ async def tier1_endpoint(
         image, hfov_deg, max_grid_side, max_relative_depth_jump, max_grazing_angle_deg
     )
     return {"glb_base64": glb_b64(mesh), "depth_png_base64": png_b64(depth_png),
-            "stats": stats}
+            "stats": json_safe(stats)}
 
 
 @app.post("/scene")
@@ -658,7 +681,7 @@ async def scene_endpoint(
         glb = glb_b64(tier1_mesh)
 
     return {"glb_base64": glb, "depth_png_base64": png_b64(depth_png),
-            "overlay_png_base64": png_b64(overlay), "stats": stats}
+            "overlay_png_base64": png_b64(overlay), "stats": json_safe(stats)}
 
 
 print("server defined —", len(app.routes), "routes")
