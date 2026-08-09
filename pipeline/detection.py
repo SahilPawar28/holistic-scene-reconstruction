@@ -185,6 +185,32 @@ def deduplicate_boxes(boxes: list[DetectedBox], iou_threshold: float = 0.5) -> l
     return kept
 
 
+def _object_nouns() -> list[str]:
+    from .semantic import DEFAULT_VOCABULARY
+
+    return [text for text, category in DEFAULT_VOCABULARY if category == "object"]
+
+
+def is_ambiguous_label(label: str, vocabulary: list[str] | None = None) -> bool:
+    """True when a detection's label spans more than one distinct object.
+
+    GroundingDINO's phrase grounding sometimes fuses several matched
+    vocabulary phrases into one run-on string for a single box — observed
+    on a real photo as "a sofa an armchair a wooden chair a bed" for what
+    was, physically, one piece of furniture. When that happens the box
+    itself is usually poorly localised too: the model was not confident
+    enough about *which* object this is to commit to one phrase, and a
+    label spanning four unrelated categories is not something the rest of
+    the pipeline should treat as ground truth. Better to mark it untrusted
+    and let CLIP's crop classification (which looks at the actual pixels,
+    not just the token span) settle it instead.
+    """
+    vocabulary = vocabulary or _object_nouns()
+    text = label.lower()
+    matches = sum(1 for noun in vocabulary if noun.lower().strip(". ") in text)
+    return matches > 1
+
+
 def clip_box(box: tuple[float, float, float, float], width: int, height: int):
     x0, y0, x1, y1 = box
     return (

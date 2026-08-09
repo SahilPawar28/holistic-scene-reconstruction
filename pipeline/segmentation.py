@@ -639,6 +639,8 @@ def instances_from_detections(
     """
     import numpy as np
 
+    from .detection import is_ambiguous_label
+
     predictor.set_image(np.asarray(image.convert("RGB")))
     instances = []
     for i, det in enumerate(detections):
@@ -654,12 +656,18 @@ def instances_from_detections(
             score=float(scores[0]),
         )
         inst.label = det.label
+        # A label spanning several unrelated vocabulary phrases means the
+        # detector was not confident which single object this is — its box
+        # is kept (it is still evidence something is here), but the label
+        # is not trusted, so run_segmentation sends it to CLIP for a real
+        # answer instead of displaying the garbled text.
+        ambiguous = is_ambiguous_label(det.label)
         inst.meta.update(
             semantic_label=det.label,
             semantic_category="object",
             semantic_confidence=float(det.score),
             semantic_margin=1.0,
-            semantic_trusted=True,
+            semantic_trusted=not ambiguous,
             source="detection",
         )
         instances.append(inst)

@@ -201,8 +201,23 @@ class PlacementParams:
     # exemption — an object CLIP is unsure about still needs to prove itself
     # geometrically. effective_min_coverage = min_coverage - relief *
     # semantic_confidence, floored so nothing is ever fully exempt.
-    semantic_gate_relief: float = 0.35
-    min_effective_coverage: float = 0.20
+    # Widened from 0.35/0.20 after a real photo showed the gap: the actual
+    # dish in a food photo was labelled correctly ("a bowl", 64% confidence)
+    # but scored 0.334 coverage — its own reflective glaze and the steam/
+    # shadow around it corrupt the depth the same way the museum jug's glass
+    # case did. 0.35/0.20 still rejected it (threshold 0.375); 0.45/0.15
+    # keeps it while still rejecting a synthetic low-confidence blob at
+    # matching coverage — the floor stops relief from ever fully exempting
+    # an object regardless of confidence.
+    semantic_gate_relief: float = 0.45
+    min_effective_coverage: float = 0.15
+
+    # --- overlap resolution ---
+    # Two objects sharing more than this fraction of the smaller one's
+    # volume are treated as a solver error, not real furniture arrangement
+    # (a pot resting on a table shares only a thin contact slice, not a
+    # third of its own volume). The worse-fit one is dropped.
+    max_overlap_fraction: float = 0.30
 
     snap_to_support: bool = True
     # Only snap when the correction is small. A big correction means the
@@ -1063,7 +1078,87 @@ def place_objects(
             p.status = f"rejected:poor-fit {p.rms_error:.2f}m"
 
     snap_placements_to_supports(placements, meshes, floor, up, params)
+    resolve_overlaps(placements, meshes, params)
     return placements
+
+
+def _world_aabb(mesh, placement: "Placement") -> tuple[np.ndarray, np.ndarray]:
+    world = placement.apply(np.asarray(mesh.vertices, dtype=np.float64))
+    return world.min(axis=0), world.max(axis=0)
+
+
+def _aabb_overlap_fraction(
+    a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]
+) -> float:
+    """Intersection volume over the smaller box's own volume, in [0, 1].
+
+    Relative to the smaller object rather than the union: a small object
+    fully swallowed by a large one scores 1.0 either way round, which is
+    what should trigger a rejection regardless of which one happens to be
+    "a" versus "b".
+    """
+    lo = np.maximum(a[0], b[0])
+    hi = np.minimum(a[1], b[1])
+    inter = np.prod(np.maximum(hi - lo, 0.0))
+    if inter <= 0:
+        return 0.0
+    vol_a = np.prod(np.maximum(a[1] - a[0], 1e-9))
+    vol_b = np.prod(np.maximum(b[1] - b[0], 1e-9))
+    return float(inter / max(min(vol_a, vol_b), 1e-9))
+
+
+def resolve_overlaps(
+    placements: list["Placement"], meshes: dict[int, object], params: PlacementParams
+) -> None:
+    """Drop the worse-fit object out of any pair that clips through each other.
+
+    Each object is placed independently against its own target cloud, so
+    nothing before this point stops two of them from occupying the same
+    space — a solver error on one object can happily land it halfway inside
+    its neighbour. This is deliberately the crude version of the joint
+    reasoning a system like Picasso does properly (see project notes): no
+    physics, no repositioning, just "if these two occupy mostly the same
+    volume, keep the one with better evidence and drop the other" — but
+    dropping is enough to stop a scene from reading as visibly broken, which
+    is the actual, immediate problem.
+
+    Volume overlap, not 2D footprint overlap, is what is tested, so a pot
+    legitimately resting on a table is unaffected: their AABBs touch only
+    at a thin contact slice near the table's top, which is a tiny fraction
+    of the pot's own volume, not a large one. Two chairs placed on top of
+    each other by a bad fit, by contrast, share most of their volume.
+    """
+    ok = [p for p in placements if p.ok]
+    boxes = {
+        p.instance_id: _world_aabb(meshes[p.instance_id], p)
+        for p in ok
+        if meshes.get(p.instance_id) is not None
+    }
+
+    dropped: set[int] = set()
+    for i in range(len(ok)):
+        for j in range(i + 1, len(ok)):
+            a, b = ok[i], ok[j]
+            if a.instance_id in dropped or b.instance_id in dropped:
+                continue
+            if a.instance_id not in boxes or b.instance_id not in boxes:
+                continue
+            frac = _aabb_overlap_fraction(boxes[a.instance_id], boxes[b.instance_id])
+            if frac < params.max_overlap_fraction:
+                continue
+
+            # Keep the better-supported placement; combine coverage and fit
+            # error the same way _score() ranks candidates during solving,
+            # so this is judging by the same evidence the solver itself
+            # trusted, not a separate ad hoc rule.
+            score_a = _score(a.rms_error, a.coverage)
+            score_b = _score(b.rms_error, b.coverage)
+            loser = b if score_a <= score_b else a
+            loser.status = (
+                f"rejected:overlaps-object:{a.instance_id if loser is b else b.instance_id} "
+                f"({frac:.2f} of its volume)"
+            )
+            dropped.add(loser.instance_id)
 
 
 def kept_instance_ids(placements: list[Placement]) -> set[int]:

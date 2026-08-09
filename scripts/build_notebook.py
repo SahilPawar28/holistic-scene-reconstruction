@@ -233,6 +233,10 @@ _missing = [
         ("pipeline.inpaint", _has_module("pipeline.inpaint")),
         ("pipeline.detection", _has_module("pipeline.detection")),
         ("segmentation.merge_instances", hasattr(segmentation, "merge_instances")),
+        ("assembly.resolve_overlaps", hasattr(assembly, "resolve_overlaps")),
+        ("assembly gate v2 (0.45 relief)",
+         hasattr(assembly, "PlacementParams")
+         and assembly.PlacementParams().semantic_gate_relief >= 0.45),
     ] if not present
 ]
 if _missing:
@@ -408,7 +412,10 @@ def run_segmentation(image: Image.Image, depth_map, max_objects=6,
         # Detection-seeded instances already carry a trusted label; only
         # label what came from the automatic pass and was not merged into
         # one of them.
-        unlabelled = [i for i in instances if i.meta.get("source") != "detection"]
+        unlabelled = [
+            i for i in instances
+            if i.meta.get("source") != "detection" or not i.meta.get("semantic_trusted")
+        ]
         if unlabelled:
             labeler.annotate(image, unlabelled)
 
@@ -683,7 +690,16 @@ async def scene_endpoint(
             # position the photo was taken from — orbit at all and there is
             # nothing behind the object. An inpainted, continuous mesh has
             # a plausible (if low-detail) wall/table there instead.
-            occupied = occupancy_mask(kept_instances, depth_result.depth.shape)
+            # Every DETECTED object gets its footprint inpainted, not just
+            # the ones that ended up with a placed 3D mesh. A rejected
+            # object still caused a real depth discontinuity in the original
+            # photo, and Tier 1's own edge-aware culling removes the
+            # bridging triangles there regardless of whether we placed
+            # anything — so a rejected object left a black gap even though
+            # no hole was ever deliberately cut. Inpainting the full
+            # candidate set closes that; only kept_instances get an actual
+            # mesh placed on top afterwards.
+            occupied = occupancy_mask(instances, depth_result.depth.shape)
             inpainted_image, inpainted_depth = inpaint_background(
                 image, depth_result.depth, occupied
             )
@@ -693,7 +709,8 @@ async def scene_endpoint(
             ).mesh
             stats["background"] = {"mode": "depth-mesh-inpainted",
                                    "faces": int(len(background_geom.faces)),
-                                   "inpainted_for": sorted(kept_ids)}
+                                   "inpainted_for": sorted(i.id for i in instances),
+                                   "mesh_placed_for": sorted(kept_ids)}
         else:
             stats["background"] = {"mode": "fitted-planes"}
 
