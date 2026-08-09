@@ -290,32 +290,10 @@ from pipeline.assembly import (PlacementParams, kept_instance_ids,
 from pipeline.camera import camera_from_image
 from pipeline.meshing import MeshingParams, backproject_mask, depth_to_mesh
 from pipeline.scene_compose import compose_scene, scene_statistics
+from pipeline.serialization import json_safe
 from pipeline.room_shell import RansacParams, fit_room_shell
 from pipeline.segmentation import background_mask, occupancy_mask
 from pipeline.objects import canonicalize_mesh, prepare_crops
-
-
-def json_safe(value):
-    """Strip NaN/Inf so FastAPI can serialise the stats.
-
-    JSON has no representation for NaN, and json.dumps raises rather than
-    emitting one — so a single unmeasurable statistic buried anywhere in the
-    stats tree takes down the whole response and the user gets no scene at
-    all. Several fields are legitimately NaN (depth relief with too few
-    pixels, RMS error on a failed fit), so they are converted to null here
-    once, centrally, instead of being guarded at every site that writes one.
-    """
-    if isinstance(value, dict):
-        return {k: json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_safe(v) for v in value]
-    if isinstance(value, (float, np.floating)):
-        return float(value) if np.isfinite(value) else None
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    return value
 
 
 def to_b64(data: bytes) -> str:
