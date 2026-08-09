@@ -43,10 +43,11 @@ HISTORY_DIR = os.path.join(BASE_DIR, "history")
 IMAGES_DIR = os.path.join(HISTORY_DIR, "images")
 MODELS_DIR = os.path.join(HISTORY_DIR, "models")
 DEPTH_DIR = os.path.join(HISTORY_DIR, "depth")
+STAGES_DIR = os.path.join(HISTORY_DIR, "stages")
 HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
-for d in (IMAGES_DIR, MODELS_DIR, DEPTH_DIR):
+for d in (IMAGES_DIR, MODELS_DIR, DEPTH_DIR, STAGES_DIR):
     os.makedirs(d, exist_ok=True)
 
 if not os.path.exists(HISTORY_FILE):
@@ -63,7 +64,10 @@ DEFAULT_COLAB_URL = os.environ.get("COLAB_SERVER_URL", "")
 
 # Tier 2 runs depth, segmentation and one TripoSR pass per object, so a
 # multi-object scene legitimately takes several minutes on a free T4.
-TIMEOUTS = {"convert": 300, "tier1": 420, "tier2": 1200}
+# Stepwise runs the identical pipeline plus encodes every intermediate
+# artifact to base64, which costs real time on a slow tunnel — budgeted
+# generously rather than have a demo run die two minutes from the end.
+TIMEOUTS = {"convert": 300, "tier1": 420, "tier2": 1200, "stepwise": 1500}
 
 
 def load_config() -> dict:
@@ -239,6 +243,95 @@ def _decode_scene_response(resp, record_id: str) -> dict:
     return out
 
 
+def _save_b64_file(data_b64: str, folder: str, name: str) -> str:
+    """Decode one base64 artifact to disk, return its /files URL."""
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(data_b64))
+    rel = os.path.relpath(path, HISTORY_DIR).replace(os.sep, "/")
+    return f"/files/{rel}"
+
+
+def _decode_stepwise_response(resp, record_id: str) -> dict:
+    """Unpack a /scene/stepwise response: every stage's artifact saved to
+    its own file, base64 replaced with URLs the frontend can load directly.
+
+    Each stage type carries a different shape of payload (a single image, a
+    before/after pair, a gallery of crops, a gallery of individual .glb
+    files, or the final composed .glb), so this switches on `type` rather
+    than assuming one shape fits all of them.
+    """
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Colab returned a non-JSON response")
+
+    if "stages" not in payload:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Colab response missing 'stages': {str(payload)[:300]}",
+        )
+
+    stage_dir = os.path.join(STAGES_DIR, record_id)
+    out_stages = []
+    model_url = None
+
+    for stage in payload["stages"]:
+        sid = stage["id"]
+        entry = {"id": sid, "title": stage.get("title", sid),
+                 "caption": stage.get("caption", ""), "type": stage["type"]}
+
+        if stage["type"] == "image":
+            entry["image_url"] = _save_b64_file(
+                stage["image_base64"], stage_dir, f"{sid}.png"
+            )
+        elif stage["type"] == "compare":
+            entry["before_url"] = _save_b64_file(
+                stage["before_base64"], stage_dir, f"{sid}_before.png"
+            )
+            entry["after_url"] = _save_b64_file(
+                stage["after_base64"], stage_dir, f"{sid}_after.png"
+            )
+        elif stage["type"] == "gallery":
+            entry["items"] = [
+                {
+                    "id": it["id"], "label": it.get("label"),
+                    "warnings": it.get("warnings", []),
+                    "image_url": _save_b64_file(
+                        it["image_base64"], stage_dir, f"{sid}_{it['id']}.png"
+                    ),
+                }
+                for it in stage["items"]
+            ]
+        elif stage["type"] == "gallery3d":
+            items = []
+            for it in stage["items"]:
+                item = {"id": it["id"], "label": it.get("label"),
+                        "error": it.get("error"), "faces": it.get("faces")}
+                if it.get("glb_base64"):
+                    item["model_url"] = _save_b64_file(
+                        it["glb_base64"], stage_dir, f"{sid}_{it['id']}.glb"
+                    )
+                items.append(item)
+            entry["items"] = items
+        elif stage["type"] == "glb":
+            entry["model_url"] = _save_b64_file(
+                stage["glb_base64"], stage_dir, f"{sid}.glb"
+            )
+            model_url = entry["model_url"]  # the final stage's scene
+
+        out_stages.append(entry)
+
+    out = {"stages": out_stages, "stats": payload.get("stats", {})}
+    if model_url:
+        # Keeps stepwise records compatible with everything that expects a
+        # top-level model_url (the history thumbnail row, the default 3D
+        # view when a record is selected).
+        out["model_url"] = model_url
+    return out
+
+
 def _record(record_id: str, mode: str, filename: str, image_name: str, extra: dict) -> dict:
     record = {
         "id": record_id,
@@ -333,6 +426,36 @@ async def scene_tier2(
                    _decode_scene_response(resp, record_id))
 
 
+@app.post("/scene/stepwise")
+async def scene_stepwise(
+    file: UploadFile = File(...),
+    hfov_deg: float = Form(60.0),
+    max_objects: int = Form(6),
+    plane_threshold: float = Form(0.03),
+    background_mode: str = Form("depth"),
+):
+    """Every stage of Tier 2 as its own inspectable artifact.
+
+    Same pipeline as /scene/tier2, run once — this does not trade accuracy
+    for visibility, it just keeps what each stage produced instead of
+    discarding it once the next stage consumed it.
+    """
+    record_id, image_name, image_path = _save_upload(file)
+    resp = _post_to_colab(
+        "/scene/stepwise",
+        image_path,
+        {
+            "hfov_deg": str(hfov_deg),
+            "max_objects": str(max_objects),
+            "plane_threshold": str(plane_threshold),
+            "background_mode": background_mode,
+        },
+        TIMEOUTS["stepwise"],
+    )
+    return _record(record_id, "stepwise", file.filename, image_name,
+                   _decode_stepwise_response(resp, record_id))
+
+
 @app.delete("/history/{record_id}")
 def delete_record(record_id: str):
     history = load_history()
@@ -352,6 +475,13 @@ def delete_record(record_id: str):
         path = os.path.join(folder, os.path.basename(url))
         if os.path.exists(path):
             os.remove(path)
+
+    # Stepwise records scatter many files (per-stage images, per-object
+    # crops, per-object .glb) under one folder keyed by record id, rather
+    # than a handful of named fields — remove the whole thing at once.
+    stage_dir = os.path.join(STAGES_DIR, record_id)
+    if os.path.isdir(stage_dir):
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
     save_history([r for r in history if r["id"] != record_id])
     return {"deleted": record_id}

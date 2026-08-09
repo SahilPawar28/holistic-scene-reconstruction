@@ -39,6 +39,7 @@
   .badge.object { background: #3a3a44; color: #bbb; }
   .badge.tier1 { background: #204a3a; color: #7fe0b0; }
   .badge.tier2 { background: #2b2a5c; color: #a9b4ff; }
+  .badge.stepwise { background: #3a2a5c; color: #d1a9ff; }
   .delete-btn { background: none; border: none; color: #666; font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px; line-height: 1; }
   .delete-btn:hover { background: #3a2222; color: #ff6b6b; }
 
@@ -87,6 +88,46 @@
   #stats-panel .row span:last-child { color: #e2e2ea; font-family: ui-monospace, monospace; text-align: right; }
   #stats-panel .warn { color: #ffb46b; }
 
+  /* Stepwise mode: a bar of stage buttons, and a full-panel overlay for
+     stages that aren't a 3D model (images, before/after, crop galleries). */
+  #stage-bar { display: none; position: absolute; top: 16px; left: 16px; right: 16px; z-index: 11;
+    flex-wrap: wrap; gap: 6px; background: rgba(20,20,24,0.9); border: 1px solid #26262c;
+    border-radius: 10px; padding: 8px; }
+  .stage-btn { background: #1d1d22; border: 1px solid #2c2c34; color: #b6b6c2; padding: 7px 11px;
+    border-radius: 7px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+  .stage-btn:hover { background: #26262e; }
+  .stage-btn.active { background: #33407a; border-color: #6d8bff; color: #fff; }
+  .stage-btn.failed-hint { border-color: #7a4a33; }
+
+  #stage-panel { display: none; position: absolute; top: 78px; left: 16px; right: 16px; bottom: 16px;
+    z-index: 10; background: rgba(15,15,18,0.97); border: 1px solid #26262c; border-radius: 12px;
+    padding: 20px; flex-direction: column; align-items: center; overflow-y: auto; gap: 14px; }
+  .stage-image { max-width: 100%; max-height: 70vh; border-radius: 8px; object-fit: contain; }
+  .stage-caption { color: #9a9aa5; font-size: 13px; text-align: center; max-width: 720px; line-height: 1.5; }
+
+  .stage-compare-row { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; width: 100%; }
+  .stage-compare-col { flex: 1; min-width: 240px; max-width: 46%; }
+  .stage-compare-col img { width: 100%; border-radius: 8px; display: block; }
+  .stage-compare-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: #7d8bd0; margin-bottom: 6px; text-align: center; }
+
+  .stage-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 14px; width: 100%; }
+  .stage-gallery-card { background: #1a1a1f; border: 1px solid #26262c; border-radius: 10px;
+    padding: 8px; text-align: center; }
+  .stage-gallery-card img { width: 100%; border-radius: 6px; display: block; background: #000; }
+  .stage-gallery-label { font-size: 12px; color: #ddd; margin-top: 6px; }
+  .stage-gallery-warn { font-size: 10px; color: #ffb46b; margin-top: 4px; line-height: 1.4; }
+
+  #stage-gallery3d-picker { display: none; position: absolute; top: 78px; left: 16px; right: 16px;
+    z-index: 10; flex-wrap: wrap; gap: 6px; background: rgba(20,20,24,0.85); border: 1px solid #26262c;
+    border-radius: 10px; padding: 8px; }
+  .g3d-pill { background: #1d1d22; border: 1px solid #2c2c34; color: #b6b6c2; padding: 6px 10px;
+    border-radius: 999px; cursor: pointer; font-size: 11px; }
+  .g3d-pill:hover { background: #26262e; }
+  .g3d-pill.active { background: #33407a; border-color: #6d8bff; color: #fff; }
+  .g3d-pill.failed { border-color: #7a4a33; color: #d38a6a; }
+
   #light-controls { position: absolute; bottom: 16px; left: 16px; z-index: 10; background: rgba(20,20,24,0.88); padding: 10px 14px; border-radius: 10px; font-size: 12px; }
   #light-controls label { display: block; margin-bottom: 4px; color: #9a9aa5; }
   #brightness { width: 180px; }
@@ -128,6 +169,7 @@
       <button class="mode-btn" data-mode="object"><b>Object</b>v1 — one object</button>
       <button class="mode-btn active" data-mode="tier1"><b>Tier 1</b>whole scene</button>
       <button class="mode-btn" data-mode="tier2"><b>Tier 2</b>compositional</button>
+      <button class="mode-btn" data-mode="stepwise"><b>Stepwise</b>see every stage</button>
     </div>
 
     <div id="chat-list"></div>
@@ -163,6 +205,10 @@
         </div>
       </div>
     </div>
+
+    <div id="stage-bar"></div>
+    <div id="stage-gallery3d-picker"></div>
+    <div id="stage-panel"></div>
 
     <div id="compare-panel">
       <div id="compare-tabs">
@@ -269,6 +315,7 @@
     object: { endpoint: "/convert",     label: "single object (TripoSR)",       eta: "10–30s" },
     tier1:  { endpoint: "/scene/tier1", label: "whole-scene mesh",              eta: "20–60s" },
     tier2:  { endpoint: "/scene/tier2", label: "compositional scene",           eta: "2–10 min" },
+    stepwise: { endpoint: "/scene/stepwise", label: "every pipeline stage, inspectable", eta: "3–12 min" },
   };
   let currentMode = "tier1";
 
@@ -393,7 +440,12 @@
   const gltfLoader = new THREE.GLTFLoader();
   const orientationSteps = { x: 0, y: 0, z: 0 };
 
-  function isSceneMode(mode) { return mode === "tier1" || mode === "tier2"; }
+  // "stepwise" is a scene like tier1/tier2 for the record as a whole (its
+  // final stage is a full composed scene, camera-space, needing photo-view
+  // framing) — but individual "gallery3d" items are single canonical-frame
+  // objects, not yet placed, and are loaded with an explicit {mode:"object"}
+  // override rather than the record itself, so they still get orbit framing.
+  function isSceneMode(mode) { return mode === "tier1" || mode === "tier2" || mode === "stepwise"; }
 
   function prepareMaterials(root) {
     root.traverse((child) => {
@@ -662,6 +714,164 @@
     tab.addEventListener("click", () => showPreview(tab.dataset.view))
   );
 
+  // ---------------- Stepwise: one button per pipeline stage --------------
+  //
+  // Every stage's artifact is already in `record.stages` the moment the
+  // record is selected — the whole reconstruction ran once on the server
+  // and sent every intermediate back in one response. So "backtracking"
+  // between stages here is purely a local UI switch: no re-fetch, no
+  // re-running anything, just swapping which piece of already-loaded data
+  // is on screen. That is what makes it safe to click freely back and
+  // forth between "SAM2 masks" and "final scene" without cost.
+  const stageBarEl = $("stage-bar");
+  const stagePanelEl = $("stage-panel");
+  const stageG3dPickerEl = $("stage-gallery3d-picker");
+
+  function hideStageUI() {
+    stageBarEl.style.display = "none";
+    stagePanelEl.style.display = "none";
+    stageG3dPickerEl.style.display = "none";
+  }
+
+  function renderStageBar(record) {
+    stageBarEl.style.display = "flex";
+    stageBarEl.innerHTML = "";
+    record.stages.forEach((stage) => {
+      const btn = document.createElement("button");
+      btn.className = "stage-btn";
+      btn.dataset.stageId = stage.id;
+      btn.textContent = stage.title;
+      btn.title = stage.caption || "";
+      btn.addEventListener("click", () => showStage(record, stage));
+      stageBarEl.appendChild(btn);
+    });
+    const startStage = record.stages.find((s) => s.id === "final") || record.stages[0];
+    if (startStage) showStage(record, startStage);
+  }
+
+  function showStage(record, stage) {
+    document.querySelectorAll(".stage-btn").forEach((b) =>
+      b.classList.toggle("active", b.dataset.stageId === stage.id)
+    );
+    stagePanelEl.style.display = "none";
+    stageG3dPickerEl.style.display = "none";
+    stagePanelEl.innerHTML = "";
+
+    if (stage.type === "glb") {
+      loadModelFromUrl(API_BASE + stage.model_url, record);
+      return;
+    }
+    if (stage.type === "gallery3d") {
+      renderGallery3dPicker(record, stage);
+      return;
+    }
+
+    // image / compare / gallery all render into the same overlay panel,
+    // covering the 3D viewer rather than replacing it — the last-loaded
+    // model stays ready underneath for whenever the user picks a 3D stage.
+    stagePanelEl.style.display = "flex";
+    // The straighten-model panel belongs to whatever 3D object was loaded
+    // last (a leftover from an earlier "Generated 3D models" visit) and has
+    // nothing to do with a 2D image/compare/gallery stage — left showing,
+    // it visually collides with the panel content.
+    orientControls.style.display = "none";
+    const caption = document.createElement("div");
+    caption.className = "stage-caption";
+    caption.textContent = stage.caption || "";
+
+    if (stage.type === "image") {
+      const img = document.createElement("img");
+      img.className = "stage-image";
+      img.src = API_BASE + stage.image_url;
+      stagePanelEl.appendChild(img);
+      stagePanelEl.appendChild(caption);
+    } else if (stage.type === "compare") {
+      const row = document.createElement("div");
+      row.className = "stage-compare-row";
+      const column = (label, url) => {
+        const col = document.createElement("div");
+        col.className = "stage-compare-col";
+        const h = document.createElement("div");
+        h.className = "stage-compare-label";
+        h.textContent = label;
+        const img = document.createElement("img");
+        img.src = API_BASE + url;
+        col.appendChild(h);
+        col.appendChild(img);
+        return col;
+      };
+      row.appendChild(column("Before", stage.before_url));
+      row.appendChild(column("After", stage.after_url));
+      stagePanelEl.appendChild(row);
+      stagePanelEl.appendChild(caption);
+    } else if (stage.type === "gallery") {
+      const grid = document.createElement("div");
+      grid.className = "stage-gallery-grid";
+      stage.items.forEach((it) => {
+        const card = document.createElement("div");
+        card.className = "stage-gallery-card";
+        const img = document.createElement("img");
+        img.src = API_BASE + it.image_url;
+        const label = document.createElement("div");
+        label.className = "stage-gallery-label";
+        label.textContent = it.label || `object ${it.id}`;
+        card.appendChild(img);
+        card.appendChild(label);
+        if (it.warnings && it.warnings.length) {
+          const warn = document.createElement("div");
+          warn.className = "stage-gallery-warn";
+          warn.textContent = "⚠ " + it.warnings.join("; ");
+          card.appendChild(warn);
+        }
+        grid.appendChild(card);
+      });
+      stagePanelEl.appendChild(grid);
+      stagePanelEl.appendChild(caption);
+    }
+  }
+
+  /**
+   * The "generated 3D models" stage holds one mesh per object, each still
+   * in TripoSR's own canonical frame — not yet placed in the scene. These
+   * are shown one at a time in the main 3D viewer (single-object framing,
+   * the same as the "Object" mode), with a pill row to switch between them
+   * and see which ones actually turned out usable before placement ever
+   * gets a chance to hide a bad one.
+   */
+  function renderGallery3dPicker(record, stage) {
+    stageG3dPickerEl.style.display = "flex";
+    stageG3dPickerEl.innerHTML = "";
+
+    const items = stage.items || [];
+    const firstUsable = items.find((it) => it.model_url) || items[0];
+
+    items.forEach((it) => {
+      const btn = document.createElement("button");
+      btn.className = "g3d-pill" + (!it.model_url ? " failed" : "");
+      btn.textContent = (it.label || `object ${it.id}`) + (it.model_url ? "" : " (failed)");
+      btn.title = it.model_url
+        ? `${it.faces ? it.faces.toLocaleString() + " triangles" : ""}`
+        : `Generation failed: ${it.error || "unknown error"}`;
+      btn.addEventListener("click", () => {
+        stageG3dPickerEl.querySelectorAll(".g3d-pill").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        if (it.model_url) {
+          loadModelFromUrl(API_BASE + it.model_url, { mode: "object" });
+        } else {
+          statusEl.textContent = `"${it.label || "object"}" failed to generate: ${it.error || "unknown error"}`;
+        }
+      });
+      if (it === firstUsable) btn.classList.add("active");
+      stageG3dPickerEl.appendChild(btn);
+    });
+
+    if (firstUsable && firstUsable.model_url) {
+      loadModelFromUrl(API_BASE + firstUsable.model_url, { mode: "object" });
+    } else {
+      statusEl.textContent = "No objects in this scene generated successfully.";
+    }
+  }
+
   function refreshPreviewPanel() {
     if (!currentRecord) { comparePanel.style.display = "none"; return; }
     comparePanel.style.display = "block";
@@ -750,6 +960,7 @@
             currentRecord = null;
             comparePanel.style.display = "none";
             statsPanel.style.display = "none";
+            hideStageUI();
             const next = chatListEl.lastElementChild;
             if (next) next.click(); else statusEl.textContent = "Pick an image and a mode, then hit Build.";
           }
@@ -763,7 +974,12 @@
       document.querySelectorAll(".chat-item").forEach((el) => el.classList.remove("active"));
       item.classList.add("active");
       currentRecord = record;
-      loadModelFromUrl(API_BASE + record.model_url, record);
+      hideStageUI();
+      if (record.mode === "stepwise" && Array.isArray(record.stages)) {
+        renderStageBar(record);
+      } else {
+        loadModelFromUrl(API_BASE + record.model_url, record);
+      }
       refreshPreviewPanel();
       renderStats(record.stats);
     });

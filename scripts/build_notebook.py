@@ -236,6 +236,8 @@ _missing = [
         ("assembly.resolve_overlaps", hasattr(assembly, "resolve_overlaps")),
         ("assembly.TRIPOSR_TO_SCENE (calibrated orientation)",
          hasattr(assembly, "TRIPOSR_TO_SCENE")),
+        ("segmentation.merge_instances (stepwise dependency)",
+         hasattr(segmentation, "merge_instances")),
         ("assembly gate v2 (0.45 relief)",
          hasattr(assembly, "PlacementParams")
          and assembly.PlacementParams().semantic_gate_relief >= 0.45),
@@ -375,10 +377,14 @@ def run_tier1(image: Image.Image, hfov_deg=60.0, max_grid_side=480,
     return tier1.mesh, stats, depth_png, depth_result, cam
 
 
-def run_segmentation(image: Image.Image, depth_map, max_objects=6,
-                     rejections=None, use_semantics=True, use_detection=True):
+def run_segmentation_detailed(image: Image.Image, depth_map, max_objects=6,
+                              use_semantics=True, use_detection=True):
     """SAM2 (automatic) + GroundingDINO (text-prompted) -> merge -> CLIP
     labelling for anything detection did not already label -> filtering.
+
+    Returns every intermediate, not just the final list — this is what
+    powers the Stepwise viewer. `run_segmentation` below is the thin
+    wrapper for callers that only want the end result.
 
     Two independent proposal mechanisms feed one instance list: the
     automatic pass samples a point grid and knows nothing about what it is
@@ -390,40 +396,64 @@ def run_segmentation(image: Image.Image, depth_map, max_objects=6,
     """
     segmenter.params.max_instances = int(max_objects)
     raw = segmenter.raw_masks(image)
-    instances = []
+    auto_instances = []
     for i, m in enumerate(raw):
         mask = segmentation.clean_mask(np.asarray(m["segmentation"], dtype=bool))
         area = int(np.count_nonzero(mask))
         if area == 0:
             continue
-        instances.append(segmentation.Instance(
+        auto_instances.append(segmentation.Instance(
             id=i, mask=mask, bbox=segmentation.mask_to_bbox(mask), area=area,
             score=float(m.get("predicted_iou", 1.0))))
 
+    detections, detected_instances = [], []
     if use_detection:
         try:
             detections = detector.detect(image)
-            detected = segmentation.instances_from_detections(
-                image, detections, segmenter.predictor, start_id=len(instances)
+            detected_instances = segmentation.instances_from_detections(
+                image, detections, segmenter.predictor, start_id=len(auto_instances)
             )
-            instances = segmentation.merge_instances(instances, detected)
         except Exception as exc:
             print(f"  detection pass failed, continuing with automatic masks only: {exc}")
 
-    if use_semantics and instances:
+    merged = (segmentation.merge_instances(auto_instances, detected_instances)
+             if use_detection else list(auto_instances))
+
+    if use_semantics and merged:
         # Detection-seeded instances already carry a trusted label; only
         # label what came from the automatic pass and was not merged into
         # one of them.
         unlabelled = [
-            i for i in instances
+            i for i in merged
             if i.meta.get("source") != "detection" or not i.meta.get("semantic_trusted")
         ]
         if unlabelled:
             labeler.annotate(image, unlabelled)
 
-    segmentation.attach_depth_stats(instances, depth_map)
-    return segmentation.filter_instances(
-        instances, depth=depth_map, params=segmenter.params, rejections=rejections)
+    segmentation.attach_depth_stats(merged, depth_map)
+    rejections = []
+    filtered = segmentation.filter_instances(
+        merged, depth=depth_map, params=segmenter.params, rejections=rejections)
+
+    return {
+        "auto_instances": auto_instances,
+        "detections": detections,
+        "detected_instances": detected_instances,
+        "merged_instances": merged,
+        "filtered_instances": filtered,
+        "rejections": rejections,
+    }
+
+
+def run_segmentation(image: Image.Image, depth_map, max_objects=6,
+                     rejections=None, use_semantics=True, use_detection=True):
+    """Thin wrapper over run_segmentation_detailed for callers that only
+    want the final object list (the /segment and /scene endpoints)."""
+    result = run_segmentation_detailed(image, depth_map, max_objects,
+                                       use_semantics, use_detection)
+    if rejections is not None:
+        rejections.extend(result["rejections"])
+    return result["filtered_instances"]
 
 
 def mask_overlay(image: Image.Image, instances) -> Image.Image:
@@ -440,13 +470,74 @@ def mask_overlay(image: Image.Image, instances) -> Image.Image:
     return Image.fromarray(np.clip(base, 0, 255).astype(np.uint8))
 
 
-def generate_object_meshes(image, instances, depth_map, resolution=256):
+def resize_max(image, max_side=720):
+    """Cap an image's longest side, for base64 payloads that don't need
+    full resolution — the Stepwise viewer's overlays are for inspection,
+    not pixel-level scrutiny."""
+    w, h = image.size
+    if max(w, h) <= max_side:
+        return image
+    scale = max_side / max(w, h)
+    return image.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+
+
+def indexed_mask_overlay(image, instances, highlight_ids=None):
+    """Like mask_overlay, but instances outside `highlight_ids` are dimmed.
+
+    Used for the "objects vs. structure" stepwise stage: one image showing
+    every candidate that survived merging, with the ones the filter actually
+    kept as objects standing out and the rejected ones faded — so the
+    filtering decision is visible in a single glance rather than a list of
+    ids to cross-reference.
+    """
+    base = np.asarray(image.convert("RGB"), dtype=np.float32)
+    palette = np.array([
+        [255, 96, 96], [96, 200, 255], [140, 255, 140], [255, 210, 90],
+        [220, 130, 255], [90, 255, 220], [255, 150, 200], [190, 190, 255],
+    ], dtype=np.float32)
+    out = base.copy()
+    for i, inst in enumerate(instances):
+        colour = palette[i % len(palette)]
+        weight = 0.55 if (highlight_ids is None or inst.id in highlight_ids) else 0.22
+        out[inst.mask] = (1 - weight) * base[inst.mask] + weight * colour
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
+
+
+def draw_detection_boxes(image, detections):
+    """Boxes + label + score overlay for the detection stepwise stage."""
+    from PIL import ImageDraw, ImageFont
+
+    img = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    palette = [(255,96,96),(96,200,255),(140,255,140),(255,210,90),
+              (220,130,255),(90,255,220),(255,150,200),(190,190,255)]
+    for i, det in enumerate(detections):
+        colour = palette[i % len(palette)]
+        x0, y0, x1, y1 = [int(round(v)) for v in det.box]
+        draw.rectangle([x0, y0, x1, y1], outline=colour, width=3)
+        label = f"{det.label[:26]} {det.score:.2f}"
+        ty = max(0, y0 - 14)
+        draw.rectangle([x0, ty, x0 + 7 * len(label) + 6, ty + 13], fill=colour)
+        draw.text((x0 + 3, ty), label, fill=(15, 15, 18), font=font)
+    return img
+
+
+def generate_object_meshes(image, instances, depth_map, resolution=256, crops=None):
     """TripoSR once per object, in this one session.
 
     Batching matters here: the model stays resident, so a six-object scene
     costs six forward passes rather than six model loads.
+
+    `crops` lets a caller that already built the crops (the Stepwise
+    endpoint, which shows them as their own stage) hand them in rather than
+    having them built a second time.
     """
-    crops = prepare_crops(image, instances, depth_map, output_size=512)
+    if crops is None:
+        crops = prepare_crops(image, instances, depth_map, output_size=512)
     generated = []
     for crop in crops:
         t0 = time.time()
@@ -514,7 +605,7 @@ def health():
             "segmentation": segmenter.checkpoint,
             "generation": "stabilityai/TripoSR",
         },
-        "endpoints": ["/depth", "/segment", "/object", "/tier1", "/scene"],
+        "endpoints": ["/depth", "/segment", "/object", "/tier1", "/scene", "/scene/stepwise"],
     }
 
 
@@ -728,6 +819,153 @@ async def scene_endpoint(
 
     return {"glb_base64": glb, "depth_png_base64": png_b64(depth_png),
             "overlay_png_base64": png_b64(overlay), "stats": json_safe(stats)}
+
+
+@app.post("/scene/stepwise")
+async def scene_stepwise_endpoint(
+    file: UploadFile = File(...),
+    hfov_deg: float = Form(60.0),
+    max_objects: int = Form(6),
+    plane_threshold: float = Form(0.03),
+    background_mode: str = Form("depth"),
+):
+    """Every stage of Tier 2, captured as its own artifact.
+
+    Runs the IDENTICAL pipeline /scene does -- same functions, same order,
+    same objects.py/assembly.py/room_shell.py code -- it just keeps what
+    each stage produced instead of only keeping what the next stage
+    consumed. Nothing here is a separate, lighter, or approximate version
+    of the real pipeline; it is the real pipeline with checkpoints.
+    """
+    image = await read_image(file)
+    stages = []
+    stats = {"mode": "stepwise"}
+
+    def add_stage(sid, title, caption, **kw):
+        stage = {"id": sid, "title": title, "caption": caption}
+        stage.update(kw)
+        stages.append(stage)
+
+    add_stage("photo", "1. Photo", "The input photograph.",
+              type="image", image_base64=png_b64(resize_max(image)))
+
+    tier1_mesh, tier1_stats, depth_png, depth_result, cam = run_tier1(
+        image, hfov_deg=hfov_deg
+    )
+    stats["tier1"] = tier1_stats
+    dr = tier1_stats.get("depth_range", [0, 0])
+    add_stage("depth", "2. Depth estimation",
+              f"Depth Anything V2. Range {dr[0]:.2f}-{dr[1]:.2f}m. "
+              "Every 3D point in every later stage comes from this map.",
+              type="image", image_base64=png_b64(resize_max(depth_png)))
+
+    seg = run_segmentation_detailed(image, depth_result.depth, max_objects)
+    add_stage("sam2", "3. SAM2 automatic masks",
+              f"{len(seg['auto_instances'])} raw regions proposed by a point-grid pass "
+              "that knows nothing about what it is looking at.",
+              type="image",
+              image_base64=png_b64(resize_max(mask_overlay(image, seg["auto_instances"]))))
+
+    det_source = (draw_detection_boxes(image, seg["detections"])
+                 if seg["detections"] else image)
+    add_stage("detection", "4. Text-prompted detection",
+              f"{len(seg['detections'])} boxes from GroundingDINO, asking directly for "
+              "named objects -- this is what recovers things the automatic pass misses.",
+              type="image", image_base64=png_b64(resize_max(det_source)))
+
+    kept_ids_seg = {i.id for i in seg["filtered_instances"]}
+    add_stage("filtered", "5. Objects vs. structure",
+              f"{len(seg['merged_instances'])} candidates after merging -> "
+              f"{len(seg['filtered_instances'])} kept as real, distinct foreground objects. "
+              "Dim regions were rejected as structure, duplicates, or noise.",
+              type="image",
+              image_base64=png_b64(resize_max(indexed_mask_overlay(
+                  image, seg["merged_instances"], highlight_ids=kept_ids_seg))))
+    stats["segmentation"] = {
+        "auto_masks": len(seg["auto_instances"]),
+        "detections": len(seg["detections"]),
+        "merged": len(seg["merged_instances"]),
+        "kept": len(seg["filtered_instances"]),
+        "rejected": [{"area": i.area, "bbox": list(i.bbox), "reason": why}
+                    for i, why in seg["rejections"][:20]],
+    }
+
+    instances = seg["filtered_instances"]
+    crops = prepare_crops(image, instances, depth_result.depth, output_size=512)
+    add_stage("crops", "6. Per-object crops",
+              "Each object cropped to its own SAM2 mask, background flattened to grey, "
+              "contrast-enhanced -- exactly what TripoSR receives, one at a time.",
+              type="gallery",
+              items=[{
+                  "id": c.instance_id,
+                  "label": c.meta.get("semantic_label") or f"object {c.instance_id}",
+                  "image_base64": png_b64(c.image.resize((256, 256), Image.LANCZOS)),
+                  "warnings": c.meta.get("crop_warnings", []),
+              } for c in crops])
+
+    generated = generate_object_meshes(image, instances, depth_result.depth, crops=crops)
+    stats["generation"] = [
+        {"instance_id": g.instance_id,
+         "label": g.crop.meta.get("semantic_label"),
+         "crop_warnings": g.crop.meta.get("crop_warnings"), **g.meta}
+        for g in generated
+    ]
+    add_stage("models", "7. Generated 3D models",
+              "TripoSR's output per object, each in its own canonical frame -- not yet "
+              "scaled, rotated or positioned into the scene. Pick one to inspect it.",
+              type="gallery3d",
+              items=[{
+                  "id": g.instance_id,
+                  "label": g.crop.meta.get("semantic_label") or f"object {g.instance_id}",
+                  "glb_base64": glb_b64(g.mesh) if g.mesh is not None else None,
+                  "error": g.meta.get("error"),
+                  "faces": g.meta.get("faces"),
+              } for g in generated])
+
+    bg = background_mask(instances, depth_result.depth.shape)
+    bg_cloud = backproject_mask(bg, depth_result.depth, cam, max_points=60000,
+                                depth_percentile_trim=None)
+    shell = fit_room_shell(bg_cloud, image, cam,
+                           RansacParams(distance_threshold=float(plane_threshold)))
+    stats["room_shell"] = shell.stats
+
+    placements = place_objects(generated, instances, depth_result.depth, cam, shell)
+    stats["placement"] = [p.summary() for p in placements]
+    kept_ids = kept_instance_ids(placements)
+    kept_instances = [i for i in instances if i.id in kept_ids]
+    stats["quality_gate"] = {
+        "kept": sorted(kept_ids),
+        "rejected": [{"instance_id": p.instance_id, "reason": p.status,
+                     "coverage": round(float(p.coverage), 3)}
+                    for p in placements if not p.ok],
+    }
+
+    occupied = occupancy_mask(instances, depth_result.depth.shape)
+    inpainted_image, inpainted_depth = inpaint_background(
+        image, depth_result.depth, occupied
+    )
+    add_stage("background", "8. Background fill",
+              "Every detected object's footprint is filled -- colour via texture "
+              "propagation, depth via a smooth harmonic solve -- before meshing. A "
+              "rejected object leaves a plausible wall behind it, not a hole.",
+              type="compare",
+              before_base64=png_b64(resize_max(image)),
+              after_base64=png_b64(resize_max(inpainted_image)))
+
+    background_geom = depth_to_mesh(
+        inpainted_image, inpainted_depth, cam, MeshingParams(max_grid_side=480)
+    ).mesh
+    stats["background"] = {"faces": int(len(background_geom.faces)),
+                           "mesh_placed_for": sorted(kept_ids)}
+
+    scene = compose_scene(shell, generated, placements, background_mesh=background_geom)
+    stats["scene"] = scene_statistics(scene, placements)
+    add_stage("final", "9. Final assembled scene",
+              f"{len(kept_ids)} of {len(instances)} detected objects placed and composed "
+              "with the inpainted background into one scene graph.",
+              type="glb", glb_base64=glb_b64(scene))
+
+    return {"stages": stages, "stats": json_safe(stats)}
 
 
 print("server defined —", len(app.routes), "routes")
