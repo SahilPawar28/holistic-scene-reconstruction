@@ -199,6 +199,36 @@ def test_tier1_survives_noise() -> None:
           f"{result.stats['faces']} faces")
 
 
+def test_inpaint_leaves_no_holes() -> None:
+    print("\ninpaint: filled regions must not be re-culled into black patches")
+    from pipeline.inpaint import inpaint_depth
+    from pipeline.segmentation import instances_from_masks, occupancy_mask
+
+    scene = synthetic.default_scene()
+    instances = instances_from_masks(list(scene.object_masks.values()), scene.depth)
+    occupied = occupancy_mask(instances, scene.depth.shape)
+
+    for label, smooth in (("nearest-neighbour", False), ("harmonic", True)):
+        filled = inpaint_depth(scene.depth.astype(np.float32), occupied, smooth=smooth)
+        step = np.abs(np.diff(filled, axis=1))
+        interior = occupied[:, :-1] & occupied[:, 1:]
+        relative = step[interior] / np.maximum(filled[:, :-1][interior], 1e-6)
+        result = depth_to_mesh(scene.pil_image(), filled, scene.camera, MeshingParams())
+        print(f"        {label:18s} max interior step {relative.max():.4f}  "
+              f"culled_jump {result.stats['culled_depth_jump']:,}")
+        if smooth:
+            # The whole point: a filled region with interior steps above the
+            # cull threshold gets punched back out into a star-shaped hole,
+            # which is what the black patches were.
+            check("harmonic fill leaves no step above the cull threshold",
+                  relative.max() < MeshingParams().max_relative_depth_jump,
+                  f"max step {relative.max():.4f} vs threshold "
+                  f"{MeshingParams().max_relative_depth_jump}")
+            check("harmonic fill causes no depth-jump culling",
+                  result.stats["culled_depth_jump"] == 0,
+                  f"{result.stats['culled_depth_jump']} triangles culled")
+
+
 def test_glb_export() -> None:
     print("\nmeshing: .glb export")
     import tempfile
@@ -232,6 +262,7 @@ def main() -> int:
     test_backprojection_against_truth()
     test_tier1_mesh()
     test_tier1_survives_noise()
+    test_inpaint_leaves_no_holes()
     test_glb_export()
 
     print("\n" + "=" * 68)
