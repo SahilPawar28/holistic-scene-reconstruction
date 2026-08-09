@@ -231,6 +231,8 @@ _missing = [
          hasattr(assembly, "PlacementParams")
          and hasattr(assembly.PlacementParams(), "semantic_gate_relief")),
         ("pipeline.inpaint", _has_module("pipeline.inpaint")),
+        ("pipeline.detection", _has_module("pipeline.detection")),
+        ("segmentation.merge_instances", hasattr(segmentation, "merge_instances")),
     ] if not present
 ]
 if _missing:
@@ -285,6 +287,14 @@ from pipeline.semantic import SemanticLabeler
 
 labeler = SemanticLabeler(device=DEVICE).load()
 print("semantic labeller ready:", labeler.params.checkpoint)
+
+# 5) GroundingDINO for text-prompted detection, recovering objects the
+#    automatic mask generator's point grid misses (occluded, low-contrast,
+#    or simply unlucky with where the grid landed).
+from pipeline.detection import GroundingDinoDetector
+
+detector = GroundingDinoDetector(device=DEVICE).load()
+print("detector ready:", detector.params.checkpoint)
 
 gc.collect(); torch.cuda.empty_cache()
 print("VRAM used: %.2f GB" % (torch.cuda.memory_allocated() / 1e9 if DEVICE == "cuda" else 0))
@@ -360,12 +370,17 @@ def run_tier1(image: Image.Image, hfov_deg=60.0, max_grid_side=480,
 
 
 def run_segmentation(image: Image.Image, depth_map, max_objects=6,
-                     rejections=None, use_semantics=True):
-    """SAM2 -> CLIP labelling -> filtering.
+                     rejections=None, use_semantics=True, use_detection=True):
+    """SAM2 (automatic) + GroundingDINO (text-prompted) -> merge -> CLIP
+    labelling for anything detection did not already label -> filtering.
 
-    Labelling happens between the two so semantics can drive the filter:
-    the raw masks are annotated first, then `filter_instances` lets a
-    confident "this is a wall" override the geometric heuristics.
+    Two independent proposal mechanisms feed one instance list: the
+    automatic pass samples a point grid and knows nothing about what it is
+    looking at; the detection pass asks directly for named objects and
+    recovers ones the grid missed (a chair blending into a similarly-toned
+    floor was the case that motivated this — the automatic pass never
+    proposed a mask for it at all, so no downstream filter could have kept
+    it either).
     """
     segmenter.params.max_instances = int(max_objects)
     raw = segmenter.raw_masks(image)
@@ -379,8 +394,23 @@ def run_segmentation(image: Image.Image, depth_map, max_objects=6,
             id=i, mask=mask, bbox=segmentation.mask_to_bbox(mask), area=area,
             score=float(m.get("predicted_iou", 1.0))))
 
+    if use_detection:
+        try:
+            detections = detector.detect(image)
+            detected = segmentation.instances_from_detections(
+                image, detections, segmenter.predictor, start_id=len(instances)
+            )
+            instances = segmentation.merge_instances(instances, detected)
+        except Exception as exc:
+            print(f"  detection pass failed, continuing with automatic masks only: {exc}")
+
     if use_semantics and instances:
-        labeler.annotate(image, instances)
+        # Detection-seeded instances already carry a trusted label; only
+        # label what came from the automatic pass and was not merged into
+        # one of them.
+        unlabelled = [i for i in instances if i.meta.get("source") != "detection"]
+        if unlabelled:
+            labeler.annotate(image, unlabelled)
 
     segmentation.attach_depth_stats(instances, depth_map)
     return segmentation.filter_instances(

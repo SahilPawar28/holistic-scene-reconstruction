@@ -551,6 +551,17 @@ class SAM2Segmenter:
                 self._device = "cpu"
         return self._device
 
+    @property
+    def predictor(self):
+        """Box-prompted SAM2ImagePredictor, for detection-seeded masks.
+
+        SAM2AutomaticMaskGenerator already owns one of these internally to
+        do its own point-prompted predictions, so this reuses it rather
+        than loading a second copy of the same model.
+        """
+        self.load()
+        return self._generator.predictor
+
     def load(self) -> "SAM2Segmenter":
         if self._generator is not None:
             return self
@@ -608,6 +619,84 @@ class SAM2Segmenter:
             torch.cuda.empty_cache()
         except ImportError:  # pragma: no cover
             pass
+
+
+def instances_from_detections(
+    image, detections: list, predictor, start_id: int = 0
+) -> list:
+    """GroundingDINO boxes -> precise SAM2 masks, one instance each.
+
+    `predictor` is a SAM2ImagePredictor (box-prompted mode, distinct from
+    the automatic mask generator's point-grid mode). A detected box gives
+    SAM2 a strong hint about *where* to look, which is exactly the
+    information the automatic pass lacks — this is how a chair the point
+    grid never sampled still ends up with a precise silhouette.
+
+    Each instance carries its GroundingDINO label as a trusted semantic
+    result already, so it does not need CLIP relabelling: the detector
+    already answered "what is this" by construction, more directly than a
+    zero-shot crop classification would.
+    """
+    import numpy as np
+
+    predictor.set_image(np.asarray(image.convert("RGB")))
+    instances = []
+    for i, det in enumerate(detections):
+        masks, scores, _ = predictor.predict(
+            box=np.array(det.box), multimask_output=False
+        )
+        mask = np.asarray(masks[0], dtype=bool)
+        area = int(mask.sum())
+        if area == 0:
+            continue
+        inst = Instance(
+            id=start_id + i, mask=mask, bbox=mask_to_bbox(mask), area=area,
+            score=float(scores[0]),
+        )
+        inst.label = det.label
+        inst.meta.update(
+            semantic_label=det.label,
+            semantic_category="object",
+            semantic_confidence=float(det.score),
+            semantic_margin=1.0,
+            semantic_trusted=True,
+            source="detection",
+        )
+        instances.append(inst)
+    return instances
+
+
+def merge_instances(
+    automatic: list, detected: list, iou_threshold: float = 0.5
+) -> list:
+    """Combine automatic-mask and detection-seeded instances, deduplicated.
+
+    Detection-seeded instances win when they overlap an automatic one
+    (their label comes directly from a text query rather than a zero-shot
+    guess on whatever odd shape the automatic mask happened to be), but the
+    automatic mask's own geometry is not discarded unless the detector's
+    silhouette is what actually survives — in practice both come from the
+    same SAM2 model, so this mostly decides *labels*, not shapes.
+    New detections with no matching automatic mask are appended outright,
+    which is the entire point of running detection in the first place: it
+    recovers objects the automatic pass never proposed at all.
+    """
+    merged = list(automatic)
+    for det_inst in detected:
+        best_iou, best_idx = 0.0, -1
+        for idx, auto_inst in enumerate(merged):
+            iou = mask_iou(det_inst.mask, auto_inst.mask)
+            if iou > best_iou:
+                best_iou, best_idx = iou, idx
+        if best_iou >= iou_threshold:
+            merged[best_idx].label = det_inst.label
+            merged[best_idx].meta.update(det_inst.meta)
+        else:
+            merged.append(det_inst)
+
+    for new_id, inst in enumerate(merged):
+        inst.id = new_id
+    return merged
 
 
 def instances_from_masks(
