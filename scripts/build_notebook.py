@@ -209,6 +209,15 @@ if not torch.cuda.is_available():
 from pipeline import (camera, depth as depth_mod, meshing, segmentation,
                       room_shell, objects, assembly, scene_compose)
 
+
+def _has_module(name):
+    import importlib
+    try:
+        importlib.import_module(name)
+        return True
+    except ImportError:
+        return False
+
 # Version marker. Checking for a symbol that only exists in the current
 # code is the only reliable way to know the pull worked — a stale copy
 # imports perfectly happily and just behaves like the old version.
@@ -218,6 +227,10 @@ _missing = [
         ("meshing.depth_to_mesh(exclude_mask=)",
          "exclude_mask" in meshing.depth_to_mesh.__code__.co_varnames),
         ("assembly.place_objects", hasattr(assembly, "place_objects")),
+        ("assembly semantic-aware gate",
+         hasattr(assembly, "PlacementParams")
+         and hasattr(assembly.PlacementParams(), "semantic_gate_relief")),
+        ("pipeline.inpaint", _has_module("pipeline.inpaint")),
     ] if not present
 ]
 if _missing:
@@ -293,6 +306,7 @@ from pipeline.scene_compose import compose_scene, scene_statistics
 from pipeline.serialization import json_safe
 from pipeline.room_shell import RansacParams, fit_room_shell
 from pipeline.segmentation import background_mask, occupancy_mask
+from pipeline.inpaint import inpaint_background
 from pipeline.objects import canonicalize_mesh, prepare_crops
 
 
@@ -633,18 +647,23 @@ async def scene_endpoint(
 
         background_geom = None
         if background_mode in ("depth", "auto"):
-            # Shrunk slightly: the generated mesh never matches the
-            # silhouette exactly, and a flush cut leaves a black rim.
-            occupied = occupancy_mask(kept_instances, depth_result.depth.shape,
-                                      grow_px=-2)
+            # Inpaint each kept object's footprint (colour via Telea, depth
+            # via nearest-neighbour extrapolation) rather than cutting a
+            # hole. A cut hole only looks right from the exact camera
+            # position the photo was taken from — orbit at all and there is
+            # nothing behind the object. An inpainted, continuous mesh has
+            # a plausible (if low-detail) wall/table there instead.
+            occupied = occupancy_mask(kept_instances, depth_result.depth.shape)
+            inpainted_image, inpainted_depth = inpaint_background(
+                image, depth_result.depth, occupied
+            )
             background_geom = depth_to_mesh(
-                image, depth_result.depth, cam,
+                inpainted_image, inpainted_depth, cam,
                 MeshingParams(max_grid_side=480),
-                exclude_mask=occupied,
             ).mesh
-            stats["background"] = {"mode": "depth-mesh",
+            stats["background"] = {"mode": "depth-mesh-inpainted",
                                    "faces": int(len(background_geom.faces)),
-                                   "holes_cut_for": sorted(kept_ids)}
+                                   "inpainted_for": sorted(kept_ids)}
         else:
             stats["background"] = {"mode": "fitted-planes"}
 

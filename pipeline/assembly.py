@@ -185,6 +185,25 @@ class PlacementParams:
     min_coverage: float = 0.6
     max_rms_error: float = 0.25   # metres; a fit this loose is meaningless
 
+    # How much a confident semantic label relaxes the coverage bar.
+    #
+    # A hard coverage cutoff turned out to reject exactly the objects it was
+    # meant to protect. On real photos, a museum jug behind reflective glass
+    # was correctly detected and labelled "a vase" at 99.8% confidence, but
+    # its placement only reached 0.578 coverage — just under the 0.6 bar —
+    # because the glass reflections corrupt the depth around it. TripoSR's
+    # mesh was probably fine; the *measurement* it was being judged against
+    # was noisy. Low coverage is ambiguous between "bad mesh" and "hard
+    # subject", and a blind threshold cannot tell them apart.
+    #
+    # A confident label is independent evidence that this is a real,
+    # correctly-identified object, so it earns a lower bar rather than an
+    # exemption — an object CLIP is unsure about still needs to prove itself
+    # geometrically. effective_min_coverage = min_coverage - relief *
+    # semantic_confidence, floored so nothing is ever fully exempt.
+    semantic_gate_relief: float = 0.35
+    min_effective_coverage: float = 0.20
+
     snap_to_support: bool = True
     # Only snap when the correction is small. A big correction means the
     # solver and the support disagree substantially, and overriding a
@@ -213,6 +232,7 @@ class Placement:
     snap_offset: float = 0.0
     scale_prior_weight: float = 0.0   # how much the mask prior was trusted
     seed_index: int = -1              # which axis-aligned orientation won
+    gate_threshold: float = float("nan")  # effective min_coverage actually applied
     status: str = "ok"                # ok | failed:<reason>
 
     @property
@@ -249,6 +269,8 @@ class Placement:
             "snap_offset": round(float(self.snap_offset), 4),
             "scale_prior_weight": round(float(self.scale_prior_weight), 3),
             "seed_index": int(self.seed_index),
+            "gate_threshold": (round(float(self.gate_threshold), 3)
+                              if np.isfinite(self.gate_threshold) else None),
             "iterations": self.iterations,
             "target_points": self.n_target_points,
             "occlusion": round(float(self.occlusion), 3),
@@ -1024,8 +1046,19 @@ def place_objects(
     for p in placements:
         if not p.ok:
             continue
-        if params.min_coverage > 0 and p.coverage < params.min_coverage:
-            p.status = f"rejected:low-coverage {p.coverage:.2f}"
+
+        threshold = params.min_coverage
+        instance = by_id.get(p.instance_id)
+        if instance is not None and instance.meta.get("semantic_category") == "object":
+            confidence = instance.meta.get("semantic_confidence", 0.0) or 0.0
+            threshold = max(
+                params.min_effective_coverage,
+                params.min_coverage - params.semantic_gate_relief * confidence,
+            )
+        p.gate_threshold = threshold
+
+        if threshold > 0 and p.coverage < threshold:
+            p.status = f"rejected:low-coverage {p.coverage:.2f} < {threshold:.2f}"
         elif np.isfinite(p.rms_error) and p.rms_error > params.max_rms_error:
             p.status = f"rejected:poor-fit {p.rms_error:.2f}m"
 
