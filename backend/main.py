@@ -448,6 +448,38 @@ async def scene_tier2(
                    _decode_scene_response(resp, record_id))
 
 
+@app.post("/scene/tier3")
+async def scene_tier3(
+    file: UploadFile = File(...),
+    hfov_deg: float = Form(60.0),
+    max_objects: int = Form(6),
+    plane_threshold: float = Form(0.03),
+    include_tier1_fallback: bool = Form(True),
+):
+    """Identical generation to Tier 2 -- same Colab pipeline, same placement
+    solver, same quality gate and support snapping. The only difference is
+    what happens after the scene loads in the viewer: Tier 3 records let
+    the user click an object and drag/rotate it freely, with no physics or
+    collision constraint re-applied client-side. The placement solver still
+    ran for real (this is a starting arrangement worth trusting, not a
+    blank scene), it just isn't the last word.
+    """
+    record_id, image_name, image_path = _save_upload(file)
+    resp = _post_to_colab(
+        "/scene",
+        image_path,
+        {
+            "hfov_deg": str(hfov_deg),
+            "max_objects": str(max_objects),
+            "plane_threshold": str(plane_threshold),
+            "include_tier1_fallback": "1" if include_tier1_fallback else "0",
+        },
+        TIMEOUTS["tier2"],
+    )
+    return _record(record_id, "tier3", file.filename, image_name,
+                   _decode_scene_response(resp, record_id))
+
+
 @app.post("/scene/stepwise")
 async def scene_stepwise(
     file: UploadFile = File(...),

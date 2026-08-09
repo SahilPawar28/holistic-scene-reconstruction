@@ -41,6 +41,22 @@
   .badge.tier2 { background: #2b2a5c; color: #a9b4ff; }
   .badge.stepwise { background: #3a2a5c; color: #d1a9ff; }
   .badge.triposg { background: #4a3320; color: #ffb870; }
+  .badge.tier3 { background: #1f4a38; color: #7fe0b8; }
+
+  /* Tier 3: object picking + move/rotate gizmo panel */
+  #tier3-panel { display: none; position: absolute; top: 78px; left: 16px; z-index: 10;
+    flex-direction: column; gap: 6px; background: rgba(20,20,24,0.9); border: 1px solid #26262c;
+    border-radius: 10px; padding: 10px; font-size: 12px; color: #9a9aa5; min-width: 190px; }
+  #tier3-panel .t3-label { color: #ddd; font-weight: 600; }
+  #tier3-panel .t3-row { display: flex; gap: 6px; }
+  .t3-btn { flex: 1; background: #1d1d22; border: 1px solid #2c2c34; color: #b6b6c2; padding: 7px 8px;
+    border-radius: 7px; cursor: pointer; font-size: 12px; }
+  .t3-btn:hover { background: #26262e; }
+  .t3-btn.active { background: #33407a; border-color: #6d8bff; color: #fff; }
+  .t3-btn.danger { color: #ff8a8a; }
+  #tier3-hint { display: none; position: absolute; bottom: 16px; right: 16px; z-index: 9;
+    background: rgba(20,20,24,0.85); border: 1px solid #26262c; border-radius: 10px;
+    padding: 8px 12px; font-size: 11px; color: #888; max-width: 220px; }
   .delete-btn { background: none; border: none; color: #666; font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px; line-height: 1; }
   .delete-btn:hover { background: #3a2222; color: #ff6b6b; }
 
@@ -171,6 +187,7 @@
       <button class="mode-btn active" data-mode="tier1"><b>Tier 1</b>whole scene</button>
       <button class="mode-btn" data-mode="tier2"><b>Tier 2</b>compositional</button>
       <button class="mode-btn" data-mode="stepwise"><b>Stepwise</b>see every stage</button>
+      <button class="mode-btn" data-mode="tier3"><b>Tier 3</b>movable objects</button>
       <button class="mode-btn" data-mode="triposg"><b>TripoSG</b>test generator</button>
     </div>
 
@@ -211,6 +228,16 @@
     <div id="stage-bar"></div>
     <div id="stage-gallery3d-picker"></div>
     <div id="stage-panel"></div>
+
+    <div id="tier3-panel">
+      <div class="t3-label" id="t3SelectedLabel">No object selected</div>
+      <div class="t3-row">
+        <button class="t3-btn active" id="t3ModeMove" title="Drag to move (front/back/sideways)">↔ Move</button>
+        <button class="t3-btn" id="t3ModeRotate" title="Drag to rotate">⟳ Rotate</button>
+      </div>
+      <button class="t3-btn danger" id="t3Deselect">Deselect</button>
+    </div>
+    <div id="tier3-hint">Click any object in the scene to pick it up. Not restricted by walls, floor or other objects — you can put it anywhere.</div>
 
     <div id="compare-panel">
       <div id="compare-tabs">
@@ -310,6 +337,7 @@
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/DragControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
 <script>
   const API_BASE = "http://localhost:8000"; // point this at your deployed backend
 
@@ -318,6 +346,10 @@
     tier1:  { endpoint: "/scene/tier1", label: "whole-scene mesh",              eta: "20–60s" },
     tier2:  { endpoint: "/scene/tier2", label: "compositional scene",           eta: "2–10 min" },
     stepwise: { endpoint: "/scene/stepwise", label: "every pipeline stage, inspectable", eta: "3–12 min" },
+    // Same generation as Tier 2 (identical Colab pipeline, same solver) --
+    // the difference is entirely in the viewer, which lets objects in a
+    // tier3-mode scene be picked up and moved/rotated freely afterward.
+    tier3: { endpoint: "/scene/tier3", label: "compositional scene, objects movable", eta: "2–10 min" },
     // Standalone generator comparison, not part of the Tier 1/2/3 pipeline —
     // same one-object-in-one-mesh-out contract as "Object" mode, but through
     // TripoSG instead of TripoSR, so the two can be judged on identical
@@ -424,6 +456,114 @@
   dragControls.addEventListener("dragend", () => (orbitControls.enabled = true));
   dragControls.addEventListener("drag", () => pointLight.position.copy(lightHandle.position));
 
+  // ---------------- Tier 3: pick up and move/rotate individual objects ---
+  //
+  // Same generated scene as Tier 2 — the placement solver still ran for
+  // real and this is a starting arrangement worth trusting, not a blank
+  // one. What's different is purely in the viewer: click an object to
+  // grab it, then drag to move or rotate it anywhere, with nothing
+  // stopping it from passing through a wall or another object. That is
+  // the point, not an oversight — this mode exists specifically for
+  // "what if I wanted it somewhere else", and re-applying the placement
+  // solver's own constraints here would just fight the user.
+  //
+  // Selection is shown with a THREE.BoxHelper (a wireframe outline) rather
+  // than recolouring the mesh, so a photo-textured or vertex-coloured
+  // object keeps looking like what it actually is while selected.
+  const transformControls = new THREE.TransformControls(camera, renderer.domElement);
+  transformControls.setMode("translate");
+  // A click landing right at the end of a gizmo drag can reach the
+  // selection click-handler below (the pointerup that ends the drag and
+  // the click that would otherwise re-run raycasting happen in the same
+  // gesture) — without this guard, dragging an object could immediately
+  // deselect it the instant the drag finished, since the cursor is no
+  // longer over the object it just moved out from under. justEndedDrag
+  // stays true for one tick so that specific click is ignored.
+  let justEndedDrag = false;
+  transformControls.addEventListener("dragging-changed", (e) => {
+    orbitControls.enabled = !e.value;
+    if (!e.value) {
+      justEndedDrag = true;
+      setTimeout(() => { justEndedDrag = false; }, 250);
+    }
+  });
+  scene.add(transformControls);
+
+  let selectedObject = null;
+  let selectionBox = null;
+  const t3Raycaster = new THREE.Raycaster();
+  const t3Pointer = new THREE.Vector2();
+
+  const tier3PanelEl = $("tier3-panel");
+  const tier3HintEl = $("tier3-hint");
+  const t3SelectedLabelEl = $("t3SelectedLabel");
+  const t3ModeMoveBtn = $("t3ModeMove");
+  const t3ModeRotateBtn = $("t3ModeRotate");
+
+  function tier3Active() {
+    return !!(currentRecord && currentRecord.mode === "tier3");
+  }
+
+  /**
+   * Walk up from a raycast hit to the direct child of currentModel that
+   * represents one placed object ("object_0", "object_1", ...). The
+   * background/room-shell node is deliberately excluded — it is the scene
+   * itself, not a movable thing inside it.
+   */
+  function selectableAncestor(obj) {
+    let cur = obj;
+    while (cur && cur.parent && cur.parent !== currentModel) cur = cur.parent;
+    return cur && cur.name && cur.name.startsWith("object_") ? cur : null;
+  }
+
+  function selectTier3Object(obj) {
+    selectedObject = obj;
+    transformControls.attach(obj);
+    if (selectionBox) scene.remove(selectionBox);
+    selectionBox = new THREE.BoxHelper(obj, 0xffcc44);
+    scene.add(selectionBox);
+    tier3PanelEl.style.display = "flex";
+    t3SelectedLabelEl.textContent = obj.name.replace("object_", "Object ");
+  }
+
+  function deselectTier3Object() {
+    selectedObject = null;
+    transformControls.detach();
+    if (selectionBox) { scene.remove(selectionBox); selectionBox = null; }
+    tier3PanelEl.style.display = "none";
+  }
+
+  renderer.domElement.addEventListener("click", (e) => {
+    if (!tier3Active() || !currentModel || transformControls.dragging || justEndedDrag) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    t3Pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    t3Pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    t3Raycaster.setFromCamera(t3Pointer, camera);
+    const hits = t3Raycaster.intersectObjects(currentModel.children, true);
+    const hit = hits.find((h) => selectableAncestor(h.object));
+    if (hit) selectTier3Object(selectableAncestor(hit.object));
+    else deselectTier3Object();
+  });
+
+  t3ModeMoveBtn.addEventListener("click", () => {
+    transformControls.setMode("translate");
+    t3ModeMoveBtn.classList.add("active");
+    t3ModeRotateBtn.classList.remove("active");
+  });
+  t3ModeRotateBtn.addEventListener("click", () => {
+    transformControls.setMode("rotate");
+    t3ModeRotateBtn.classList.add("active");
+    t3ModeMoveBtn.classList.remove("active");
+  });
+  $("t3Deselect").addEventListener("click", deselectTier3Object);
+
+  window.addEventListener("keydown", (e) => {
+    if (!tier3Active() || !selectedObject) return;
+    if (e.key === "Escape") deselectTier3Object();
+    else if (e.key === "g" || e.key === "G") t3ModeMoveBtn.click();
+    else if (e.key === "r" || e.key === "R") t3ModeRotateBtn.click();
+  });
+
   const baseIntensities = { ambient: 0.5, hemi: 0.9, rig: 0.55, point: 1.8 };
 
   function applyBrightness(m) {
@@ -453,7 +593,9 @@
   // framing) — but individual "gallery3d" items are single canonical-frame
   // objects, not yet placed, and are loaded with an explicit {mode:"object"}
   // override rather than the record itself, so they still get orbit framing.
-  function isSceneMode(mode) { return mode === "tier1" || mode === "tier2" || mode === "stepwise"; }
+  function isSceneMode(mode) {
+    return mode === "tier1" || mode === "tier2" || mode === "stepwise" || mode === "tier3";
+  }
 
   function prepareMaterials(root) {
     root.traverse((child) => {
@@ -584,6 +726,8 @@
 
   function loadModelFromUrl(url, record) {
     statusEl.textContent = "Loading model…";
+    deselectTier3Object(); // stale selection would point at removed geometry
+    tier3HintEl.style.display = "none";
     gltfLoader.load(
       url,
       (gltf) => {
@@ -591,6 +735,7 @@
         currentModel = gltf.scene;
         scene.add(currentModel);
         prepareMaterials(currentModel);
+        tier3HintEl.style.display = tier3Active() ? "block" : "none";
 
         const box = new THREE.Box3().setFromObject(currentModel);
         currentModel.userData.centerLocal = box.getCenter(new THREE.Vector3());
@@ -623,6 +768,7 @@
   function animate() {
     requestAnimationFrame(animate);
     orbitControls.update();
+    if (selectionBox) selectionBox.update();
     renderer.render(scene, camera);
   }
   resizeRenderer();

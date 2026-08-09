@@ -1,0 +1,52 @@
+Add Tier 3: same Tier 2 scene, objects freely movable and rotatable
+
+New mode alongside Object/Tier 1/Tier 2/Stepwise/TripoSG. Generation is
+identical to Tier 2 -- same Colab pipeline call, same placement solver,
+same quality gate and support snapping -- the new backend/scene/tier3
+endpoint is a byte-for-byte proxy of Tier 2's, saved under its own mode so
+the frontend knows to enable interaction for it. The placement solver's
+output is still a real starting arrangement worth trusting; Tier 3 just
+doesn't treat it as final.
+
+Click any placed object (raycast against nodes named "object_N", excluding
+the background/room-shell node -- that's the scene itself, not a movable
+thing in it) to select it, then drag a THREE.TransformControls gizmo to
+move it in any direction or rotate it, with nothing re-applied afterward:
+no collision check, no re-snapping to a support surface, no wall
+constraint. That absence is the point, not an oversight -- this mode
+exists specifically for "what if I wanted it somewhere else", and
+re-running the solver's own constraints here would just fight the user.
+
+Selection is shown with a THREE.BoxHelper (a separate wireframe outline
+object) rather than by recolouring the mesh, so a vertex-coloured or
+photo-textured object keeps looking exactly like what it actually is while
+selected and while being dragged -- verified directly: the object's
+material after a rotation drag still reports vertexColors=true with the
+original data untouched.
+
+Tested end to end in a live browser against a real multi-object scene built
+with trimesh's Scene.add_geometry(transform=...) pattern -- matching what
+pipeline/scene_compose.py actually emits. An earlier test build that baked
+object offsets into vertex data instead gave a false negative: it looked
+broken (gizmo appeared at the world origin, not the object), but the flaw
+was in the test data, not the feature -- TransformControls manipulates node
+position/rotation, and there was no node-level transform to manipulate
+against. Worth rebuilding the test to match the real pipeline's convention
+before trusting the result either way:
+
+  - select -> gizmo renders at the object's correct world position
+  - drag along an axis -> position changes on exactly that axis, object
+    stays selected, panel stays open
+  - switch to rotate, drag along a ring -> rotation changes, colour intact,
+    stays selected
+  - deselect / click empty space -> gizmo detaches, panel hides
+  - background/room-shell node confirmed non-selectable
+
+Found and fixed one real bug in the process: a drag ending right as the
+cursor left the object it had just moved could let a trailing click reach
+the selection handler and immediately deselect what was just placed. Added
+a short (250ms) guard after "dragging-changed" fires false so the click
+that legitimately ends a drag gesture doesn't get reinterpreted as a
+click on empty space.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
