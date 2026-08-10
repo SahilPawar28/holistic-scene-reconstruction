@@ -776,12 +776,22 @@ def project_photo_colors(mesh, image, camera_axis="z", flip_v=True):
 
     This is a deliberately light alternative: no extra models, no VRAM, no
     new dependencies beyond scipy (already installed). Every vertex whose
-    normal faces the camera gets its colour sampled directly from the photo
-    at the corresponding pixel; every vertex that doesn't (the object's
-    back, roughly) has no real photo pixel to sample, so it copies its
-    nearest front-facing neighbour's colour instead of being left grey --
-    honest about being a guess for that half, but far better than a flat
-    blob for the side the photo never showed regardless.
+    normal faces the camera AND whose projected pixel actually lands on the
+    object (not the photo's own removed-background fill) gets its colour
+    sampled directly; every other vertex -- the object's back, roughly, or
+    a front-facing vertex right at the silhouette edge whose projection
+    landed a few pixels outside the true boundary -- has no real photo
+    pixel to trust, so it copies its nearest *trustworthy* neighbour's
+    colour instead of showing the photo's flat background fill as if it
+    were the object's own colour. That second case is what real output
+    showed as visible white patches/bands on an otherwise correctly-matched
+    render: not fully back-facing, just a slightly misaligned sample.
+
+    "Lands on the background" is a flood fill from the image border through
+    near-bg_color pixels, not a flat colour threshold -- a plain threshold
+    would also wrongly exclude legitimately pale/white parts of the object
+    itself (a white lid, a cream-coloured drink), since those aren't
+    reachable from the border without crossing real object colour.
 
     TripoSG's own repo does not document which axis its canonical frame's
     camera looks down or which way is "up" (checked -- inference_triposg.py
@@ -790,8 +800,8 @@ def project_photo_colors(mesh, image, camera_axis="z", flip_v=True):
     a documented, verifiable source. `camera_axis`/`flip_v` are exposed as
     parameters rather than hard-coded because this default (+Z camera,
     image Y flipped) is a best guess at the common convention for this
-    model family, not a verified fact -- if real output comes back
-    mirrored or rotated, that is what to adjust.
+    model family -- confirmed correct against real output (front side
+    matched the photo with no mirroring/rotation needed).
     """
     verts = np.asarray(mesh.vertices, dtype=np.float64)
     normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
@@ -822,14 +832,31 @@ def project_photo_colors(mesh, image, camera_axis="z", flip_v=True):
     py = np.clip((v_norm * h).astype(int), 0, h - 1)
     sampled = img[py, px]
 
+    from scipy import ndimage
+
+    bg_color = np.array([255, 255, 255])
+    near_bg = np.abs(img.astype(int) - bg_color).max(axis=-1) <= 10
+    labeled, _ = ndimage.label(near_bg)
+    border_labels = set(labeled[0, :]) | set(labeled[-1, :]) \
+        | set(labeled[:, 0]) | set(labeled[:, -1])
+    border_labels.discard(0)
+    background_mask = np.isin(labeled, list(border_labels))
+    sampled_is_background = background_mask[py, px]
+
     front_facing = (normals @ view_dir) > 0.05
+    trustworthy = front_facing & ~sampled_is_background
     colors = sampled.astype(np.uint8).copy()
-    if front_facing.any() and not front_facing.all():
+    if trustworthy.any() and not trustworthy.all():
         from scipy.spatial import cKDTree
 
-        tree = cKDTree(verts[front_facing])
-        _, nearest = tree.query(verts[~front_facing])
-        colors[~front_facing] = sampled[front_facing][nearest]
+        tree = cKDTree(verts[trustworthy])
+        _, nearest = tree.query(verts[~trustworthy])
+        colors[~trustworthy] = sampled[trustworthy][nearest]
+    elif not trustworthy.any():
+        # Degenerate case (e.g. every projected sample missed the object) --
+        # a flat mid-grey is honest about there being no real colour
+        # information at all, rather than showing the background colour.
+        colors[:] = 160
 
     mesh.visual.vertex_colors = np.hstack(
         [colors, np.full((len(colors), 1), 255, dtype=np.uint8)]
