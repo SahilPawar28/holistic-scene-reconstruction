@@ -779,9 +779,24 @@ def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, see
         raise RuntimeError("TripoSG did not load in this session — see cell 3B's output")
     from image_process import prepare_image
 
-    prepared = prepare_image(
-        image.convert("RGB"), bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=triposg_rmbg
-    )
+    # TripoSG's prepare_image only accepts a filesystem path -- it calls
+    # os.path.isfile() on its argument and load_image() reads it with
+    # cv2.imread() internally, so a PIL Image object (what every other
+    # generator in this notebook is handed directly) fails with
+    # "TypeError: stat: path should be string ... not Image". Confirmed by
+    # reading TripoSG's own image_process.py rather than guessing at the
+    # signature. Round-trip through a temp file to match what it expects.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        image.convert("RGB").save(tmp.name)
+        tmp_path = tmp.name
+    try:
+        prepared = prepare_image(
+            tmp_path, bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=triposg_rmbg
+        )
+    finally:
+        os.remove(tmp_path)
     with torch.no_grad():
         out = triposg_pipe(
             image=prepared,
