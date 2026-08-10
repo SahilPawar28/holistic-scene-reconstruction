@@ -365,8 +365,14 @@ try:
     for _pkg in ["pymeshlab", "diso", "jaxtyping", "typeguard", "peft", "xatlas"]:
         _sp.run([sys.executable, "-m", "pip", "install", "-q", _pkg], check=False)
 
-    if TRIPOSG_DIR not in sys.path:
-        sys.path.insert(0, TRIPOSG_DIR)
+    # briarmbg.py and image_process.py (the latter used later, in
+    # generate_triposg_mesh) both live in TripoSG's scripts/ subfolder, not
+    # its repo root -- confirmed by listing the actual repo tree. Only the
+    # repo root was on sys.path before, which is exactly why `from briarmbg
+    # import BriaRMBG` failed with ModuleNotFoundError.
+    for _p in (TRIPOSG_DIR, f"{TRIPOSG_DIR}/scripts"):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
 
     from triposg.pipelines.pipeline_triposg import TripoSGPipeline
     from briarmbg import BriaRMBG
@@ -785,6 +791,33 @@ def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, see
         ).samples[0]
     mesh = trimesh.Trimesh(out[0].astype(np.float32), np.ascontiguousarray(out[1]))
     torch.cuda.empty_cache()
+
+    # TripoSG occasionally returns a mesh with a handful of non-finite
+    # vertex positions for a difficult input. Left alone, trimesh's glTF
+    # exporter writes those straight into the accessor's min/max bounds as
+    # literal NaN, which is not valid JSON -- every loader, including the
+    # browser's, then fails with an opaque "Unexpected token 'N'... is not
+    # valid JSON" instead of a message about what actually went wrong.
+    # Salvage what's usable (drop any vertex that's NaN/Inf and any face
+    # that touched one) when the damage is minor; fail with a real
+    # explanation when it isn't, rather than export a file nothing can open.
+    finite = np.isfinite(mesh.vertices).all(axis=1)
+    if not finite.all():
+        bad_fraction = 1.0 - finite.mean()
+        if bad_fraction > 0.05:
+            raise RuntimeError(
+                f"TripoSG produced a degenerate mesh: {bad_fraction:.0%} of "
+                f"vertices are NaN/Inf. This input didn't reconstruct "
+                f"cleanly -- try a different photo or seed."
+            )
+        mesh.update_faces(finite[mesh.faces].all(axis=1))
+        mesh.remove_unreferenced_vertices()
+        if len(mesh.vertices) == 0:
+            raise RuntimeError(
+                "TripoSG produced a degenerate mesh with no valid geometry "
+                "left after removing NaN/Inf vertices."
+            )
+
     return mesh
 
 

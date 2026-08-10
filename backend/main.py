@@ -69,6 +69,15 @@ DEFAULT_COLAB_URL = os.environ.get("COLAB_SERVER_URL", "")
 # generously rather than have a demo run die two minutes from the end.
 TIMEOUTS = {"convert": 300, "tier1": 420, "tier2": 1200, "stepwise": 1500, "tier4": 1500}
 
+# Free ngrok tunnels show an HTML "you're about to visit this site" warning
+# page to any request that doesn't explicitly ask to skip it -- browser
+# traffic gets a clickable "Visit Site" button, but a plain server-to-server
+# POST like ours has no way to click through it, so instead of reaching
+# Colab's FastAPI app the request just gets this HTML back with a 503. This
+# header is ngrok's own documented way to bypass that page for exactly this
+# case (a real client that isn't a browser).
+NGROK_SKIP_WARNING_HEADERS = {"ngrok-skip-browser-warning": "true"}
+
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
@@ -120,7 +129,8 @@ def get_config():
     reachable, detail = False, "not configured"
     if url:
         try:
-            r = requests.get(f"{url.rstrip('/')}/health", timeout=8)
+            r = requests.get(f"{url.rstrip('/')}/health", timeout=8,
+                            headers=NGROK_SKIP_WARNING_HEADERS)
             reachable = r.status_code == 200
             detail = r.text[:200] if reachable else f"HTTP {r.status_code}"
         except requests.exceptions.RequestException as exc:
@@ -173,6 +183,7 @@ def _post_to_colab(endpoint: str, image_path: str, data: dict, timeout: int):
                 files={"file": (os.path.basename(image_path), fh, "image/png")},
                 data=data,
                 timeout=timeout,
+                headers=NGROK_SKIP_WARNING_HEADERS,
             )
     except requests.exceptions.ConnectionError:
         raise HTTPException(
