@@ -35,6 +35,7 @@ import base64
 import io
 import json
 import re
+import time
 from dataclasses import dataclass
 
 from PIL import Image
@@ -210,30 +211,65 @@ def _call_openrouter(
     return content
 
 
+# Free-tier models on OpenRouter are not kept warm. A cold instance can take
+# long enough to start responding that OpenRouter's own gateway gives up
+# waiting on it and reports a 5xx/429 before the model ever gets a chance to
+# answer -- observed in practice as "Upstream idle timeout exceeded" (504).
+# This is almost always transient: the same request a few seconds later, once
+# something has warmed the instance up, typically succeeds. Worth retrying
+# automatically rather than surfacing it as "the VLM is broken" and falling
+# back to Tier 2 on what was really just bad timing.
+_TRANSIENT_STATUS_CODES = (429, 500, 502, 503, 504)
+
+
+def _is_transient(exc: VLMError) -> bool:
+    text = str(exc).lower()
+    if any(f"({code})" in text or f"'code': {code}" in text or f'"code": {code}' in text
+           for code in _TRANSIENT_STATUS_CODES):
+        return True
+    return "timeout" in text or "idle" in text
+
+
+def _call_with_retries(
+    image_b64: str, api_key: str, model: str, endpoint: str, prompt: str, timeout: float,
+    max_attempts: int = 3, backoff_seconds: float = 4.0,
+) -> str:
+    last_exc: VLMError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _call_openrouter(image_b64, api_key, model, endpoint, prompt, timeout)
+        except VLMError as exc:
+            last_exc = exc
+            if attempt == max_attempts or not _is_transient(exc):
+                raise
+            time.sleep(backoff_seconds * attempt)
+    raise last_exc  # pragma: no cover — loop always returns or raises
+
+
 def understand_scene(
     image: Image.Image,
     api_key: str,
     model: str = DEFAULT_MODEL,
     endpoint: str = DEFAULT_ENDPOINT,
-    timeout: float = 90.0,
+    timeout: float = 120.0,
 ) -> list[SceneObject]:
     """Ask the VLM to list every object in the photo, with grouping hints.
 
-    Raises `VLMError` if the API call fails or the model's reply cannot be
-    parsed as the expected JSON shape even after one retry with a stricter
-    reminder. Callers should treat that as "VLM understanding unavailable"
-    and decide their own fallback rather than let it silently return an
-    empty scene.
+    Raises `VLMError` if the API call fails (after retrying transient
+    gateway/timeout errors) or the model's reply cannot be parsed as the
+    expected JSON shape even after one retry with a stricter reminder.
+    Callers should treat that as "VLM understanding unavailable" and decide
+    their own fallback rather than let it silently return an empty scene.
     """
     if not api_key:
         raise VLMError("no OpenRouter API key configured")
 
     image_b64 = _encode_image(image)
-    content = _call_openrouter(image_b64, api_key, model, endpoint, _PROMPT, timeout)
+    content = _call_with_retries(image_b64, api_key, model, endpoint, _PROMPT, timeout)
     parsed = _extract_json_array(content)
 
     if parsed is None:
-        content = _call_openrouter(
+        content = _call_with_retries(
             image_b64, api_key, model, endpoint, _PROMPT + _STRICT_REMINDER, timeout
         )
         parsed = _extract_json_array(content)
