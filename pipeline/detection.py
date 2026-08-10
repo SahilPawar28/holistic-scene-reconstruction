@@ -244,7 +244,7 @@ class GroupedDetection:
     group: str
     labels: list[str]
     box: tuple[float, float, float, float]
-    wall_mounted: bool
+    flat_surface: bool
 
 
 def group_detections(
@@ -253,7 +253,7 @@ def group_detections(
     """Union per-label boxes into one box per VLM-assigned group.
 
     `scene_objects` are `vlm_understanding.SceneObject`s (label, group,
-    wall_mounted); duck-typed here rather than imported to avoid a cycle,
+    flat_surface); duck-typed here rather than imported to avoid a cycle,
     since vlm_understanding has no reason to depend on detection. Members
     of a group become one union bounding box, because they are meant to
     become one combined 3D model downstream (a bookshelf and its books,
@@ -277,20 +277,20 @@ def group_detections(
         y0 = min(b.box[1] for b in boxes)
         x1 = max(b.box[2] for b in boxes)
         y1 = max(b.box[3] for b in boxes)
-        wall_mounted = any(m.wall_mounted for m in members if m.label in boxes_by_label)
+        flat_surface = any(m.flat_surface for m in members if m.label in boxes_by_label)
         grouped.append(
             GroupedDetection(
                 group=group,
                 labels=[b.label for b in boxes],
                 box=(x0, y0, x1, y1),
-                wall_mounted=wall_mounted,
+                flat_surface=flat_surface,
             )
         )
     return grouped
 
 
 # Duck-typed stand-in purely for the type hint above; any object with
-# .label/.group/.wall_mounted attributes (e.g. vlm_understanding.SceneObject)
+# .label/.group/.flat_surface attributes (e.g. vlm_understanding.SceneObject)
 # satisfies group_detections without detection.py importing that module.
 SceneObject_ish = object
 

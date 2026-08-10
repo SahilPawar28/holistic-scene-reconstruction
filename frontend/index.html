@@ -648,6 +648,54 @@
       || mode === "tier4";
   }
 
+  /**
+   * Decode TripoSR's vertex colours from sRGB (photo/display space, the
+   * same space the pipeline's grey-flattened crops and TripoSR's own colour
+   * head both work in) into the linear space this renderer's lighting math
+   * expects.
+   *
+   * GLTFLoader (three r128) sRGB-decodes *texture* colour maps automatically
+   * (`material.map.encoding = THREE.sRGBEncoding`, set for baseColorTexture
+   * etc.) but does nothing to the COLOR_0 vertex attribute -- confirmed by
+   * reading the loader's own source, no sRGB handling near ATTRIBUTES.COLOR_0
+   * at all. The room/background mesh is photo-textured so it gets the
+   * correct decode for free; every TripoSR-generated object instead uses
+   * vertex colours, so those alone were rendered by treating an sRGB value
+   * as if it were already linear radiance -- the washed-out, pale look
+   * reported on generated objects specifically, never on the background.
+   *
+   * Idempotent per geometry (guarded by srgbDecoded) since this only needs
+   * to run once per load, not on every prepareMaterials() call (wireframe
+   * toggling calls that repeatedly and must not re-decode already-linear
+   * values).
+   *
+   * The COLOR_0 accessor trimesh exports is a normalized Uint8Array (raw
+   * bytes 0-255, WebGL divides by 255 at draw time) -- confirmed by loading
+   * a real generated scene and inspecting the attribute directly, not
+   * assumed. Treating those bytes as an already-0..1 float domain (an
+   * earlier version of this function did) corrupts them: Uint8Array writes
+   * wrap modulo 256 rather than clamping, so a formula expecting [0,1]
+   * turns bright pixels into wrapped noise instead of merely decoding them.
+   * This works in the byte's actual 0-255 domain throughout.
+   */
+  function linearizeVertexColors(root) {
+    root.traverse((child) => {
+      if (!child.isMesh) return;
+      const geom = child.geometry;
+      const color = geom && geom.attributes && geom.attributes.color;
+      if (!color || geom.userData.srgbDecoded) return;
+      const arr = color.array;
+      const isByte = arr instanceof Uint8Array || arr instanceof Uint8ClampedArray;
+      for (let i = 0; i < arr.length; i++) {
+        const c = (isByte ? arr[i] / 255 : arr[i]);
+        const linear = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+        arr[i] = isByte ? Math.round(linear * 255) : linear;
+      }
+      color.needsUpdate = true;
+      geom.userData.srgbDecoded = true;
+    });
+  }
+
   function prepareMaterials(root) {
     root.traverse((child) => {
       if (!child.isMesh) return;
@@ -785,6 +833,7 @@
         if (currentModel) scene.remove(currentModel);
         currentModel = gltf.scene;
         scene.add(currentModel);
+        linearizeVertexColors(currentModel);
         prepareMaterials(currentModel);
         tier3HintEl.style.display = tier3Active() ? "block" : "none";
 

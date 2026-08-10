@@ -692,7 +692,7 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
             vlm_stats.update({
                 "used": True,
                 "objects_named": [
-                    {"label": o.label, "group": o.group, "wall_mounted": o.wall_mounted}
+                    {"label": o.label, "group": o.group, "flat_surface": o.flat_surface}
                     for o in scene_objects
                 ],
             })
@@ -713,16 +713,16 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
     vlm_stats["labels_not_found"] = sorted(set(labels) - set(boxes_by_label.keys()))
 
     groups = group_detections(scene_objects, boxes_by_label)
-    kept_groups = [g for g in groups if not g.wall_mounted]
+    kept_groups = [g for g in groups if not g.flat_surface]
     vlm_stats["groups"] = [
-        {"group": g.group, "labels": g.labels, "wall_mounted": g.wall_mounted}
+        {"group": g.group, "labels": g.labels, "flat_surface": g.flat_surface}
         for g in groups
     ]
-    vlm_stats["wall_mounted_skipped"] = [g.group for g in groups if g.wall_mounted]
+    vlm_stats["flat_surface_skipped"] = [g.group for g in groups if g.flat_surface]
 
     if not kept_groups:
         instances = run_segmentation(image, depth_map, max_objects, rejections=rejections)
-        vlm_stats["fallback"] = "no non-wall-mounted groups detected"
+        vlm_stats["fallback"] = "every named object was flat-surface (skipped)"
         return instances, vlm_stats
 
     group_boxes = [

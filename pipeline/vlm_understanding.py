@@ -22,7 +22,7 @@ What a VLM is bad at, and known to be bad at across the field, is precise
 pixel-space grounding: asked for a bounding box directly, it routinely
 hallucinates coordinates that do not line up with the actual object. So
 this module never asks it for one. Its only output is a structured object
-list (label, group, wall_mounted) — the *semantic* judgement calls a box
+list (label, group, flat_surface) — the *semantic* judgement calls a box
 detector cannot make. The actual boxes still come from GroundingDINO,
 called once per label the VLM names instead of a fixed vocabulary; see
 `pipeline.detection`. This keeps each model doing the part it is reliable
@@ -68,9 +68,16 @@ For each object give exactly these three fields:
   table and the lamp resting on it both get group "table_lamp_1". An
   object with nothing resting on/in it gets a group equal to its own
   label.
-- "wall_mounted": true if the object is fixed to a wall or ceiling rather
-  than resting on the floor (framed pictures, wall-mounted shelves,
-  sconces, mounted TVs, curtains, ceiling lights). false otherwise.
+- "flat_surface": true ONLY if the object is essentially flat/2D and lies
+  flush against a wall, ceiling or floor with no real volume of its own -
+  a framed picture or photo, a poster, a window, a mirror flush-mounted on
+  a wall, a rug/carpet/floor mat lying flat on the floor, a wallpaper
+  pattern or wall decal. false for EVERYTHING else, including things that
+  are mounted to or pushed against a wall but still have real 3D shape and
+  depth - a wall-mounted shelf, a mounted TV, a wall sconce, a wall clock,
+  curtains, ceiling lights, an armchair or sofa against a wall, a lamp
+  standing near a wall. When in doubt whether something has real volume,
+  answer false - it should default to being modelled in 3D.
 
 Respond with ONLY a JSON array of objects with these three fields. No
 markdown fences, no prose before or after, just the JSON array."""
@@ -85,7 +92,7 @@ _STRICT_REMINDER = (
 class SceneObject:
     label: str
     group: str
-    wall_mounted: bool
+    flat_surface: bool
 
 
 class VLMError(RuntimeError):
@@ -130,8 +137,8 @@ def _parse_objects(raw: list) -> list[SceneObject]:
         if not label:
             continue
         group = str(item.get("group") or label).strip()
-        wall_mounted = bool(item.get("wall_mounted", False))
-        out.append(SceneObject(label=label, group=group, wall_mounted=wall_mounted))
+        flat_surface = bool(item.get("flat_surface", False))
+        out.append(SceneObject(label=label, group=group, flat_surface=flat_surface))
     return out
 
 
