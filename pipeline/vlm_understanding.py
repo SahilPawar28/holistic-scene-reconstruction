@@ -140,37 +140,67 @@ def _call_openrouter(
 ) -> str:
     import requests
 
-    resp = requests.post(
-        endpoint,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                        },
-                    ],
-                }
-            ],
-            "temperature": 0.0,
-        },
-        timeout=timeout,
-    )
+    try:
+        resp = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                # OpenRouter routes free-tier requests through whichever
+                # provider is currently serving that model, and several of
+                # them reject requests missing these -- not documented as
+                # required, but a real, observed failure mode for free
+                # models specifically (paid keys are more lenient).
+                "HTTP-Referer": "https://github.com/sahilpawar28/holistic-scene-reconstruction",
+                "X-Title": "Holistic Scene Reconstruction",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                            },
+                        ],
+                    }
+                ],
+                "temperature": 0.0,
+                # A room with 15-20 objects needs real room for the reply.
+                # Without an explicit cap the default can be small enough to
+                # truncate the JSON array mid-object, which then fails to
+                # parse and looks like "the VLM is broken" when it was
+                # actually just cut off.
+                "max_tokens": 3000,
+            },
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise VLMError(f"OpenRouter request failed: {type(exc).__name__}: {exc}") from exc
+
     if resp.status_code != 200:
         raise VLMError(f"OpenRouter request failed ({resp.status_code}): {resp.text[:500]}")
     data = resp.json()
+    if "error" in data:
+        # OpenRouter sometimes reports a routing/provider failure inside a
+        # 200 response rather than a non-200 status.
+        raise VLMError(f"OpenRouter reported an error: {data['error']}")
     try:
-        return data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError) as exc:
         raise VLMError(f"Unexpected OpenRouter response shape: {data}") from exc
+    if not content:
+        raise VLMError(
+            f"OpenRouter returned an empty reply (finish_reason="
+            f"{choice.get('finish_reason')!r}) -- the model may have put "
+            f"everything into a reasoning block instead of the final "
+            f"answer, or hit the token limit before writing any content."
+        )
+    return content
 
 
 def understand_scene(

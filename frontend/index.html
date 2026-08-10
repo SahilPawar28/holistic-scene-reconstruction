@@ -426,24 +426,34 @@
     const stageBar = $("stage-bar"), stageG3d = $("stage-gallery3d-picker"),
           tier3Panel = $("tier3-panel");
     if (stageBar) stageBar.style.top = topPx;
-    if (stageG3d) stageG3d.style.top = topPx;
     if (tier3Panel) tier3Panel.style.top = topPx;
 
-    // stage-panel sits below whichever of stage-bar / the gallery3d picker
-    // is actually showing right now -- both can themselves wrap onto extra
-    // rows depending on how many stages/objects there are, so this is
-    // measured too rather than assumed to fit on one line.
+    // stage-bar stays visible for the whole stepwise session (it's the
+    // 9-stage selector); the gallery3d picker only appears alongside it
+    // while viewing "7. Generated 3D models", stacked BELOW it. Pinning
+    // both to the same `topPx` (the bug just reported) put the picker's
+    // pill buttons directly underneath the stage-bar instead of below it.
+    let stageBarHeight = 0;
+    if (stageBar && stageBar.style.display !== "none") {
+      stageBarHeight = stageBar.getBoundingClientRect().height;
+    }
+    const row2Top = stageBarHeight ? top + stageBarHeight + 10 : top;
+    const row2Px = row2Top + "px";
+    if (stageG3d) stageG3d.style.top = row2Px;
+
+    // stage-panel sits below whichever of stage-bar alone, or stage-bar +
+    // the gallery3d picker, is actually showing right now -- each can
+    // itself wrap onto extra rows, so this is measured too rather than
+    // assumed to fit on one line.
     const stagePanel = $("stage-panel");
     if (stagePanel) {
-      let secondBarHeight = 0;
-      if (stageBar && stageBar.style.display !== "none") {
-        secondBarHeight = stageBar.getBoundingClientRect().height;
-      } else if (stageG3d && stageG3d.style.display !== "none") {
-        secondBarHeight = stageG3d.getBoundingClientRect().height;
+      let g3dHeight = 0;
+      if (stageG3d && stageG3d.style.display !== "none") {
+        g3dHeight = stageG3d.getBoundingClientRect().height;
       }
-      stagePanel.style.top = secondBarHeight
-        ? (top + secondBarHeight + 10) + "px"
-        : topPx;
+      stagePanel.style.top = g3dHeight
+        ? (row2Top + g3dHeight + 10) + "px"
+        : row2Px;
     }
   }
 
