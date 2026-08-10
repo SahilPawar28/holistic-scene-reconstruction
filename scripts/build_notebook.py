@@ -765,6 +765,78 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
     return kept, vlm_stats
 
 
+def project_photo_colors(mesh, image, camera_axis="z", flip_v=True):
+    """Paint an untextured mesh using the source photo directly, via simple
+    orthographic projection -- for generators like TripoSG whose own
+    pipeline produces geometry only (verified against TripoSG's actual demo
+    code: its diffusion pipeline returns bare vertices/faces, no colour;
+    getting official colour needs a separate SDXL-scale multi-view
+    texturing pipeline with a CUDA-compiled rasteriser, which does not fit
+    this project's free-tier T4 budget -- see the cell 3B commit history).
+
+    This is a deliberately light alternative: no extra models, no VRAM, no
+    new dependencies beyond scipy (already installed). Every vertex whose
+    normal faces the camera gets its colour sampled directly from the photo
+    at the corresponding pixel; every vertex that doesn't (the object's
+    back, roughly) has no real photo pixel to sample, so it copies its
+    nearest front-facing neighbour's colour instead of being left grey --
+    honest about being a guess for that half, but far better than a flat
+    blob for the side the photo never showed regardless.
+
+    TripoSG's own repo does not document which axis its canonical frame's
+    camera looks down or which way is "up" (checked -- inference_triposg.py
+    applies no orientation adjustment and has no comment about it), unlike
+    TripoSR's TRIPOSR_TO_SCENE constant a few commits back, which came from
+    a documented, verifiable source. `camera_axis`/`flip_v` are exposed as
+    parameters rather than hard-coded because this default (+Z camera,
+    image Y flipped) is a best guess at the common convention for this
+    model family, not a verified fact -- if real output comes back
+    mirrored or rotated, that is what to adjust.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
+
+    axis_index = {"x": 0, "y": 1, "z": 2}[camera_axis]
+    view_dir = np.zeros(3)
+    view_dir[axis_index] = 1.0
+    plane_axes = [i for i in range(3) if i != axis_index]
+
+    u = verts[:, plane_axes[0]]
+    v = verts[:, plane_axes[1]]
+    u_range = float(u.max() - u.min()) or 1.0
+    v_range = float(v.max() - v.min()) or 1.0
+    # Fit within a square with the same ~0.85 foreground-fraction margin
+    # convention used elsewhere in this project (objects.py's crop framing,
+    # TripoSR's own resize_foreground), so the projected silhouette lines
+    # up with how the photo was actually framed for the model.
+    span = max(u_range, v_range) / 0.85
+    uc, vc = (u.min() + u.max()) / 2.0, (v.min() + v.max()) / 2.0
+    u_norm = (u - uc) / span + 0.5
+    v_norm = (v - vc) / span + 0.5
+    if flip_v:
+        v_norm = 1.0 - v_norm
+
+    img = np.asarray(image.convert("RGB"))
+    h, w = img.shape[:2]
+    px = np.clip((u_norm * w).astype(int), 0, w - 1)
+    py = np.clip((v_norm * h).astype(int), 0, h - 1)
+    sampled = img[py, px]
+
+    front_facing = (normals @ view_dir) > 0.05
+    colors = sampled.astype(np.uint8).copy()
+    if front_facing.any() and not front_facing.all():
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(verts[front_facing])
+        _, nearest = tree.query(verts[~front_facing])
+        colors[~front_facing] = sampled[front_facing][nearest]
+
+    mesh.visual.vertex_colors = np.hstack(
+        [colors, np.full((len(colors), 1), 255, dtype=np.uint8)]
+    )
+    return mesh
+
+
 def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, seed=0):
     """One image -> one mesh via TripoSG. Deliberately mirrors /object's
     contract (TripoSR) exactly, so the two can be compared on the identical
@@ -832,6 +904,13 @@ def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, see
                 "TripoSG produced a degenerate mesh with no valid geometry "
                 "left after removing NaN/Inf vertices."
             )
+
+    # TripoSG's own pipeline is geometry-only -- see project_photo_colors's
+    # docstring for why. `prepared` (not the raw original photo) is what to
+    # sample: it's the same background-removed, correctly-framed image the
+    # model itself was conditioned on, so its proportions/centering actually
+    # match the mesh's canonical frame.
+    mesh = project_photo_colors(mesh, prepared)
 
     return mesh
 
