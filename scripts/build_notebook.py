@@ -615,8 +615,9 @@ def draw_detection_boxes(image, detections):
     return img
 
 
-def generate_object_meshes(image, instances, depth_map, resolution=256, crops=None):
-    """TripoSR once per object, in this one session.
+def generate_object_meshes(image, instances, depth_map, resolution=256, crops=None,
+                           generator="triposr"):
+    """One mesh per object, in this one session.
 
     Batching matters here: the model stays resident, so a six-object scene
     costs six forward passes rather than six model loads.
@@ -624,6 +625,21 @@ def generate_object_meshes(image, instances, depth_map, resolution=256, crops=No
     `crops` lets a caller that already built the crops (the Stepwise
     endpoint, which shows them as their own stage) hand them in rather than
     having them built a second time.
+
+    `generator` picks which model does the actual reconstruction:
+    "triposr" (default, always available) or "triposg" (only if it loaded
+    in this session -- see cell 3B). Both now produce colourless geometry
+    (has_vertex_color=False for TripoSR; TripoSG never had colour to begin
+    with) -- deliberate, for a consistent look between the two and because
+    a self-written photo-projection colouring pass for TripoSG looked
+    inconsistent enough on real output to not be worth keeping.
+
+    Callers placing TripoSG-generated objects into a multi-object scene
+    should pass `PlacementParams(rotation_mode="upright")` to place_objects
+    rather than the default "calibrated" mode -- that default assumes
+    TripoSR's own specific, verified output-frame convention
+    (TRIPOSR_TO_SCENE), which TripoSG has no reason to share and hasn't
+    been checked against.
     """
     if crops is None:
         crops = prepare_crops(image, instances, depth_map, output_size=512)
@@ -631,31 +647,41 @@ def generate_object_meshes(image, instances, depth_map, resolution=256, crops=No
     for crop in crops:
         t0 = time.time()
         try:
-            # The crop is already background-flattened using the instance
-            # mask, so TripoSR's own rembg step is skipped — our mask is
-            # strictly better information than its guess would be.
-            arr = np.asarray(crop.image).astype(np.float32) / 255.0
-            processed = Image.fromarray((arr * 255).astype(np.uint8))
-            with torch.no_grad():
-                codes = triposr([processed], device=DEVICE)
-            mesh = triposr.extract_mesh(codes, has_vertex_color=True,
-                                        resolution=int(resolution))[0]
-            torch.cuda.empty_cache()
+            if generator == "triposg":
+                if triposg_pipe is None:
+                    raise RuntimeError(
+                        "TripoSG did not load in this session — see cell 3B's output"
+                    )
+                mesh = generate_triposg_mesh(crop.image)
+            else:
+                # The crop is already background-flattened using the
+                # instance mask, so TripoSR's own rembg step is skipped —
+                # our mask is strictly better information than its guess.
+                arr = np.asarray(crop.image).astype(np.float32) / 255.0
+                processed = Image.fromarray((arr * 255).astype(np.uint8))
+                with torch.no_grad():
+                    codes = triposr([processed], device=DEVICE)
+                mesh = triposr.extract_mesh(codes, has_vertex_color=False,
+                                            resolution=int(resolution))[0]
+                torch.cuda.empty_cache()
             if mesh is None or len(mesh.faces) == 0:
-                raise RuntimeError("TripoSR returned an empty mesh")
+                raise RuntimeError(f"{generator} returned an empty mesh")
             canonical, scale, centre = canonicalize_mesh(mesh)
             generated.append(objects.GeneratedObject(
                 instance_id=crop.instance_id, mesh=canonical,
                 canonical_scale=scale, canonical_center=centre, crop=crop,
                 meta={"faces": int(len(canonical.faces)),
                       "seconds": round(time.time() - t0, 2),
+                      "generator": generator,
                       "occlusion": round(crop.occlusion, 3)},
             ))
         except Exception as exc:
             generated.append(objects.GeneratedObject(
                 instance_id=crop.instance_id, mesh=None, canonical_scale=1.0,
                 canonical_center=np.zeros(3), crop=crop,
-                meta={"error": f"{type(exc).__name__}: {exc}"},
+                meta={"error": f"{type(exc).__name__}: {exc}",
+                      "seconds": round(time.time() - t0, 2),
+                      "generator": generator},
             ))
             torch.cuda.empty_cache()
     return generated
@@ -682,6 +708,13 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
     if no API key is configured or the VLM call fails, so a missing or
     broken key degrades Tier 4 to Tier 2 rather than failing the scene
     outright.
+
+    Returns (instances, vlm_stats, debug). `debug` carries the actual
+    intermediate objects (not just the JSON-safe summaries in vlm_stats) --
+    scene_objects and boxes_by_label -- so a caller that wants to *show*
+    what happened (Stepwise) can draw the real per-label detection boxes
+    rather than re-deriving or approximating them. Tier 4's own endpoint
+    ignores this third value.
     """
     from pipeline import vlm_understanding
     from pipeline.detection import DetectedBox, detect_from_labels, group_detections
@@ -689,12 +722,14 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
     if rejections is None:
         rejections = []
     vlm_stats = {"used": False}
+    debug = {"scene_objects": None, "boxes_by_label": {}, "groups": []}
 
     scene_objects = None
     if api_key:
         try:
             kwargs = {"model": vlm_model} if vlm_model else {}
             scene_objects = vlm_understanding.understand_scene(image, api_key, **kwargs)
+            debug["scene_objects"] = scene_objects
             vlm_stats.update({
                 "used": True,
                 "objects_named": [
@@ -711,14 +746,16 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
     if not scene_objects:
         instances = run_segmentation(image, depth_map, max_objects, rejections=rejections)
         vlm_stats["fallback"] = "tier2 segmentation"
-        return instances, vlm_stats
+        return instances, vlm_stats, debug
 
     labels = [o.label for o in scene_objects]
     boxes_by_label = detect_from_labels(detector, image, labels)
+    debug["boxes_by_label"] = boxes_by_label
     vlm_stats["labels_detected"] = sorted(boxes_by_label.keys())
     vlm_stats["labels_not_found"] = sorted(set(labels) - set(boxes_by_label.keys()))
 
     groups = group_detections(scene_objects, boxes_by_label)
+    debug["groups"] = groups
     kept_groups = [g for g in groups if not g.flat_surface]
     vlm_stats["groups"] = [
         {"group": g.group, "labels": g.labels, "flat_surface": g.flat_surface}
@@ -729,7 +766,7 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
     if not kept_groups:
         instances = run_segmentation(image, depth_map, max_objects, rejections=rejections)
         vlm_stats["fallback"] = "every named object was flat-surface (skipped)"
-        return instances, vlm_stats
+        return instances, vlm_stats, debug
 
     group_boxes = [
         DetectedBox(box=g.box,
@@ -762,106 +799,7 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
         inst.id = new_id
 
     segmentation.attach_depth_stats(kept, depth_map)
-    return kept, vlm_stats
-
-
-def project_photo_colors(mesh, image, camera_axis="z", flip_v=True):
-    """Paint an untextured mesh using the source photo directly, via simple
-    orthographic projection -- for generators like TripoSG whose own
-    pipeline produces geometry only (verified against TripoSG's actual demo
-    code: its diffusion pipeline returns bare vertices/faces, no colour;
-    getting official colour needs a separate SDXL-scale multi-view
-    texturing pipeline with a CUDA-compiled rasteriser, which does not fit
-    this project's free-tier T4 budget -- see the cell 3B commit history).
-
-    This is a deliberately light alternative: no extra models, no VRAM, no
-    new dependencies beyond scipy (already installed). Every vertex whose
-    normal faces the camera AND whose projected pixel actually lands on the
-    object (not the photo's own removed-background fill) gets its colour
-    sampled directly; every other vertex -- the object's back, roughly, or
-    a front-facing vertex right at the silhouette edge whose projection
-    landed a few pixels outside the true boundary -- has no real photo
-    pixel to trust, so it copies its nearest *trustworthy* neighbour's
-    colour instead of showing the photo's flat background fill as if it
-    were the object's own colour. That second case is what real output
-    showed as visible white patches/bands on an otherwise correctly-matched
-    render: not fully back-facing, just a slightly misaligned sample.
-
-    "Lands on the background" is a flood fill from the image border through
-    near-bg_color pixels, not a flat colour threshold -- a plain threshold
-    would also wrongly exclude legitimately pale/white parts of the object
-    itself (a white lid, a cream-coloured drink), since those aren't
-    reachable from the border without crossing real object colour.
-
-    TripoSG's own repo does not document which axis its canonical frame's
-    camera looks down or which way is "up" (checked -- inference_triposg.py
-    applies no orientation adjustment and has no comment about it), unlike
-    TripoSR's TRIPOSR_TO_SCENE constant a few commits back, which came from
-    a documented, verifiable source. `camera_axis`/`flip_v` are exposed as
-    parameters rather than hard-coded because this default (+Z camera,
-    image Y flipped) is a best guess at the common convention for this
-    model family -- confirmed correct against real output (front side
-    matched the photo with no mirroring/rotation needed).
-    """
-    verts = np.asarray(mesh.vertices, dtype=np.float64)
-    normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
-
-    axis_index = {"x": 0, "y": 1, "z": 2}[camera_axis]
-    view_dir = np.zeros(3)
-    view_dir[axis_index] = 1.0
-    plane_axes = [i for i in range(3) if i != axis_index]
-
-    u = verts[:, plane_axes[0]]
-    v = verts[:, plane_axes[1]]
-    u_range = float(u.max() - u.min()) or 1.0
-    v_range = float(v.max() - v.min()) or 1.0
-    # Fit within a square with the same ~0.85 foreground-fraction margin
-    # convention used elsewhere in this project (objects.py's crop framing,
-    # TripoSR's own resize_foreground), so the projected silhouette lines
-    # up with how the photo was actually framed for the model.
-    span = max(u_range, v_range) / 0.85
-    uc, vc = (u.min() + u.max()) / 2.0, (v.min() + v.max()) / 2.0
-    u_norm = (u - uc) / span + 0.5
-    v_norm = (v - vc) / span + 0.5
-    if flip_v:
-        v_norm = 1.0 - v_norm
-
-    img = np.asarray(image.convert("RGB"))
-    h, w = img.shape[:2]
-    px = np.clip((u_norm * w).astype(int), 0, w - 1)
-    py = np.clip((v_norm * h).astype(int), 0, h - 1)
-    sampled = img[py, px]
-
-    from scipy import ndimage
-
-    bg_color = np.array([255, 255, 255])
-    near_bg = np.abs(img.astype(int) - bg_color).max(axis=-1) <= 10
-    labeled, _ = ndimage.label(near_bg)
-    border_labels = set(labeled[0, :]) | set(labeled[-1, :]) \
-        | set(labeled[:, 0]) | set(labeled[:, -1])
-    border_labels.discard(0)
-    background_mask = np.isin(labeled, list(border_labels))
-    sampled_is_background = background_mask[py, px]
-
-    front_facing = (normals @ view_dir) > 0.05
-    trustworthy = front_facing & ~sampled_is_background
-    colors = sampled.astype(np.uint8).copy()
-    if trustworthy.any() and not trustworthy.all():
-        from scipy.spatial import cKDTree
-
-        tree = cKDTree(verts[trustworthy])
-        _, nearest = tree.query(verts[~trustworthy])
-        colors[~trustworthy] = sampled[trustworthy][nearest]
-    elif not trustworthy.any():
-        # Degenerate case (e.g. every projected sample missed the object) --
-        # a flat mid-grey is honest about there being no real colour
-        # information at all, rather than showing the background colour.
-        colors[:] = 160
-
-    mesh.visual.vertex_colors = np.hstack(
-        [colors, np.full((len(colors), 1), 255, dtype=np.uint8)]
-    )
-    return mesh
+    return kept, vlm_stats, debug
 
 
 def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, seed=0):
@@ -871,8 +809,17 @@ def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, see
 
     Uses TripoSG's own background-removal net (BriaRMBG) rather than one of
     our SAM2 masks -- this endpoint is a standalone single-photo test of the
-    generator itself (parity with how a user tests "Object" mode today), not
+    generator itself (parity with how a user tests "TripoSR" mode today), not
     yet part of the segmented multi-object pipeline.
+
+    Pure geometry, no colour -- TripoSG's own pipeline doesn't produce any
+    (confirmed against its actual demo code), and a self-written photo-
+    projection colouring pass was tried and dropped: it worked well on the
+    object's front but needed real per-photo tuning to look right overall,
+    and a plain colourless model reads as more polished than a
+    partially/inconsistently coloured one. TripoSR-generated objects are
+    now rendered colourless too, for the same reason and for visual
+    consistency between the two generators -- see generate_object_meshes.
     """
     if triposg_pipe is None:
         raise RuntimeError("TripoSG did not load in this session — see cell 3B's output")
@@ -950,15 +897,12 @@ code('''
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-import uuid, os, io, traceback
+from fastapi.responses import JSONResponse
+import os, io, traceback
 
 app = FastAPI(title="Scene pipeline server")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
-
-OUT_DIR = "/content/outputs"
-os.makedirs(OUT_DIR, exist_ok=True)
 
 
 async def read_image(file: UploadFile) -> Image.Image:
@@ -1024,6 +968,7 @@ async def object_endpoint(file: UploadFile = File(...), resolution: int = Form(2
                           skip_background_removal: str = Form("1")):
     """One already-cropped object -> one .glb. Used by TripoSRClient when
     the pipeline is driven from outside the notebook."""
+    t0 = time.time()
     image = await read_image(file)
     if skip_background_removal not in ("1", "true", "True"):
         import rembg
@@ -1036,12 +981,13 @@ async def object_endpoint(file: UploadFile = File(...), resolution: int = Form(2
 
     with torch.no_grad():
         codes = triposr([image], device=DEVICE)
-    mesh = triposr.extract_mesh(codes, has_vertex_color=True, resolution=int(resolution))[0]
+    mesh = triposr.extract_mesh(codes, has_vertex_color=False, resolution=int(resolution))[0]
     torch.cuda.empty_cache()
 
-    path = f"{OUT_DIR}/{uuid.uuid4()}.glb"
-    mesh.export(path)
-    return FileResponse(path, media_type="model/gltf-binary", filename="object.glb")
+    return {"glb_base64": glb_b64(mesh), "stats": {
+        "generator": "TripoSR", "resolution": int(resolution),
+        "faces": int(len(mesh.faces)), "seconds": round(time.time() - t0, 2),
+    }}
 
 
 @app.post("/tier1")
@@ -1201,25 +1147,39 @@ async def scene_stepwise_endpoint(
     max_objects: int = Form(6),
     plane_threshold: float = Form(0.03),
     background_mode: str = Form("depth"),
+    use_vlm: str = Form("0"),
+    generator: str = Form("triposr"),
 ):
-    """Every stage of Tier 2, captured as its own artifact.
+    """Every stage of the pipeline, captured as its own artifact.
 
-    Runs the IDENTICAL pipeline /scene does -- same functions, same order,
-    same objects.py/assembly.py/room_shell.py code -- it just keeps what
-    each stage produced instead of only keeping what the next stage
-    consumed. Nothing here is a separate, lighter, or approximate version
-    of the real pipeline; it is the real pipeline with checkpoints.
+    Runs the IDENTICAL pipeline the real endpoints do -- same functions,
+    same order, same objects.py/assembly.py/room_shell.py/vlm_understanding
+    code -- it just keeps what each stage produced instead of only keeping
+    what the next stage consumed. Nothing here is a separate, lighter, or
+    approximate version of the real pipeline; it is the real pipeline with
+    checkpoints. `use_vlm` switches object discovery from Tier 2's
+    SAM2+GroundingDINO path to Tier 4's VLM-driven one -- same switch
+    /scene/tier4 makes, and the stages shown are built directly from what
+    that call actually returned (vlm_stats, boxes_by_label, groups), not a
+    paraphrase of it, specifically so a rejected/missed object is
+    traceable to the real reason: never named by the VLM, named but no
+    box found, or named and boxed but skipped as a flat surface.
+    `generator` picks TripoSR or TripoSG for the per-object meshes.
     """
     image = await read_image(file)
     stages = []
-    stats = {"mode": "stepwise"}
+    stats = {"mode": "stepwise", "use_vlm": use_vlm in ("1", "true", "True"),
+             "generator": generator}
+
+    stage_num = [0]
 
     def add_stage(sid, title, caption, **kw):
-        stage = {"id": sid, "title": title, "caption": caption}
+        stage_num[0] += 1
+        stage = {"id": sid, "title": f"{stage_num[0]}. {title}", "caption": caption}
         stage.update(kw)
         stages.append(stage)
 
-    add_stage("photo", "1. Photo", "The input photograph.",
+    add_stage("photo", "Photo", "The input photograph.",
               type="image", image_base64=png_b64(resize_max(image)))
 
     tier1_mesh, tier1_stats, depth_png, depth_result, cam = run_tier1(
@@ -1227,47 +1187,98 @@ async def scene_stepwise_endpoint(
     )
     stats["tier1"] = tier1_stats
     dr = tier1_stats.get("depth_range", [0, 0])
-    add_stage("depth", "2. Depth estimation",
+    add_stage("depth", "Depth estimation",
               f"Depth Anything V2. Range {dr[0]:.2f}-{dr[1]:.2f}m. "
               "Every 3D point in every later stage comes from this map.",
               type="image", image_base64=png_b64(resize_max(depth_png)))
 
-    seg = run_segmentation_detailed(image, depth_result.depth, max_objects)
-    add_stage("sam2", "3. SAM2 automatic masks",
-              f"{len(seg['auto_instances'])} raw regions proposed by a point-grid pass "
-              "that knows nothing about what it is looking at.",
-              type="image",
-              image_base64=png_b64(resize_max(mask_overlay(image, seg["auto_instances"]))))
+    if use_vlm in ("1", "true", "True"):
+        instances, vlm_stats, vlm_debug = run_vlm_segmentation(
+            image, depth_result.depth, globals().get("OPENROUTER_API_KEY", ""),
+            max_objects=max_objects, rejections=[],
+        )
+        stats["vlm_understanding"] = vlm_stats
 
-    det_source = (draw_detection_boxes(image, seg["detections"])
-                 if seg["detections"] else image)
-    add_stage("detection", "4. Text-prompted detection",
-              f"{len(seg['detections'])} boxes from GroundingDINO, asking directly for "
-              "named objects -- this is what recovers things the automatic pass misses.",
-              type="image", image_base64=png_b64(resize_max(det_source)))
+        scene_objects = vlm_debug["scene_objects"] or []
+        boxes_by_label = vlm_debug["boxes_by_label"]
+        groups = vlm_debug["groups"]
+        group_flat = {g.group: g.flat_surface for g in groups}
 
-    kept_ids_seg = {i.id for i in seg["filtered_instances"]}
-    add_stage("filtered", "5. Objects vs. structure",
-              f"{len(seg['merged_instances'])} candidates after merging -> "
-              f"{len(seg['filtered_instances'])} kept as real, distinct foreground objects. "
-              "Dim regions were rejected as structure, duplicates, or noise.",
-              type="image",
-              image_base64=png_b64(resize_max(indexed_mask_overlay(
-                  image, seg["merged_instances"], highlight_ids=kept_ids_seg))))
-    stats["segmentation"] = {
-        "auto_masks": len(seg["auto_instances"]),
-        "detections": len(seg["detections"]),
-        "merged": len(seg["merged_instances"]),
-        "kept": len(seg["filtered_instances"]),
-        "rejected": [{"area": i.area, "bbox": list(i.bbox), "reason": why}
-                    for i, why in seg["rejections"][:20]],
-    }
+        list_items = []
+        for o in scene_objects:
+            if o.label not in boxes_by_label:
+                detail, tag = "named by the VLM, but GroundingDINO found no matching box in the photo -- not included", "not-found"
+            elif group_flat.get(o.group):
+                detail, tag = "flat surface (picture/rug/etc.) -- deliberately not modelled in 3D", "skipped"
+            else:
+                detail, tag = "detected and included in the scene", "included"
+            list_items.append({"label": o.label, "detail": f"group: {o.group} — {detail}",
+                               "tag": tag})
+        if not scene_objects:
+            list_items.append({
+                "label": "VLM understanding unavailable",
+                "detail": vlm_stats.get("error", "unknown reason")
+                    + " -- fell back to Tier 2's SAM2+GroundingDINO detection below.",
+                "tag": "not-found",
+            })
+        add_stage("vlm_objects", "VLM object understanding",
+                  f"{len(scene_objects)} objects named by the vision-language model, and "
+                  "what actually happened to each one -- the real decision list, not a "
+                  "summary of it.",
+                  type="list", items=list_items)
 
-    instances = seg["filtered_instances"]
+        det_boxes = list(boxes_by_label.values())
+        det_source = draw_detection_boxes(image, det_boxes) if det_boxes else image
+        add_stage("detection", "Per-label detection",
+                  f"GroundingDINO run once per VLM-named label instead of a fixed "
+                  f"vocabulary -- {len(det_boxes)} of {len(scene_objects)} named objects "
+                  "were actually found in the photo.",
+                  type="image", image_base64=png_b64(resize_max(det_source)))
+
+        stats["segmentation"] = {
+            "vlm_objects_named": len(scene_objects),
+            "detected": len(boxes_by_label),
+            "groups": len(groups),
+            "kept": len(instances),
+        }
+    else:
+        seg = run_segmentation_detailed(image, depth_result.depth, max_objects)
+        add_stage("sam2", "SAM2 automatic masks",
+                  f"{len(seg['auto_instances'])} raw regions proposed by a point-grid pass "
+                  "that knows nothing about what it is looking at.",
+                  type="image",
+                  image_base64=png_b64(resize_max(mask_overlay(image, seg["auto_instances"]))))
+
+        det_source = (draw_detection_boxes(image, seg["detections"])
+                     if seg["detections"] else image)
+        add_stage("detection", "Text-prompted detection",
+                  f"{len(seg['detections'])} boxes from GroundingDINO, asking directly for "
+                  "named objects -- this is what recovers things the automatic pass misses.",
+                  type="image", image_base64=png_b64(resize_max(det_source)))
+
+        kept_ids_seg = {i.id for i in seg["filtered_instances"]}
+        add_stage("filtered", "Objects vs. structure",
+                  f"{len(seg['merged_instances'])} candidates after merging -> "
+                  f"{len(seg['filtered_instances'])} kept as real, distinct foreground objects. "
+                  "Dim regions were rejected as structure, duplicates, or noise.",
+                  type="image",
+                  image_base64=png_b64(resize_max(indexed_mask_overlay(
+                      image, seg["merged_instances"], highlight_ids=kept_ids_seg))))
+        stats["segmentation"] = {
+            "auto_masks": len(seg["auto_instances"]),
+            "detections": len(seg["detections"]),
+            "merged": len(seg["merged_instances"]),
+            "kept": len(seg["filtered_instances"]),
+            "rejected": [{"area": i.area, "bbox": list(i.bbox), "reason": why}
+                        for i, why in seg["rejections"][:20]],
+        }
+        instances = seg["filtered_instances"]
+
     crops = prepare_crops(image, instances, depth_result.depth, output_size=512)
-    add_stage("crops", "6. Per-object crops",
-              "Each object cropped to its own SAM2 mask, background flattened to grey, "
-              "contrast-enhanced -- exactly what TripoSR receives, one at a time.",
+    add_stage("crops", "Per-object crops",
+              "Each object cropped to its own mask, background flattened to grey, "
+              f"contrast-enhanced -- exactly what {('TripoSG' if generator == 'triposg' else 'TripoSR')} "
+              "receives, one at a time.",
               type="gallery",
               items=[{
                   "id": c.instance_id,
@@ -1276,16 +1287,20 @@ async def scene_stepwise_endpoint(
                   "warnings": c.meta.get("crop_warnings", []),
               } for c in crops])
 
-    generated = generate_object_meshes(image, instances, depth_result.depth, crops=crops)
+    t0 = time.time()
+    generated = generate_object_meshes(image, instances, depth_result.depth, crops=crops,
+                                       generator=generator)
     stats["generation"] = [
         {"instance_id": g.instance_id,
          "label": g.crop.meta.get("semantic_label"),
          "crop_warnings": g.crop.meta.get("crop_warnings"), **g.meta}
         for g in generated
     ]
-    add_stage("models", "7. Generated 3D models",
-              "TripoSR's output per object, each in its own canonical frame -- not yet "
-              "scaled, rotated or positioned into the scene. Pick one to inspect it.",
+    stats["generation_seconds_total"] = round(time.time() - t0, 2)
+    add_stage("models", "Generated 3D models",
+              f"{generator.upper() if generator == 'triposg' else 'TripoSR'}'s output per "
+              "object, each in its own canonical frame -- not yet scaled, rotated or "
+              "positioned into the scene. Pick one to inspect it.",
               type="gallery3d",
               items=[{
                   "id": g.instance_id,
@@ -1293,6 +1308,7 @@ async def scene_stepwise_endpoint(
                   "glb_base64": glb_b64(g.mesh) if g.mesh is not None else None,
                   "error": g.meta.get("error"),
                   "faces": g.meta.get("faces"),
+                  "seconds": g.meta.get("seconds"),
               } for g in generated])
 
     bg = background_mask(instances, depth_result.depth.shape)
@@ -1302,7 +1318,13 @@ async def scene_stepwise_endpoint(
                            RansacParams(distance_threshold=float(plane_threshold)))
     stats["room_shell"] = shell.stats
 
-    placements = place_objects(generated, instances, depth_result.depth, cam, shell)
+    # See scene_tier4_endpoint's comment on why TripoSG-generated objects
+    # use the search-based "upright" rotation mode rather than the default
+    # "calibrated" one, which assumes TripoSR's own verified frame.
+    placement_params = (PlacementParams(rotation_mode="upright")
+                        if generator == "triposg" else PlacementParams())
+    placements = place_objects(generated, instances, depth_result.depth, cam, shell,
+                               params=placement_params)
     stats["placement"] = [p.summary() for p in placements]
     kept_ids = kept_instance_ids(placements)
     kept_instances = [i for i in instances if i.id in kept_ids]
@@ -1317,7 +1339,7 @@ async def scene_stepwise_endpoint(
     inpainted_image, inpainted_depth = inpaint_background(
         image, depth_result.depth, occupied
     )
-    add_stage("background", "8. Background fill",
+    add_stage("background", "Background fill",
               "Every detected object's footprint is filled -- colour via texture "
               "propagation, depth via a smooth harmonic solve -- before meshing. A "
               "rejected object leaves a plausible wall behind it, not a hole.",
@@ -1333,7 +1355,7 @@ async def scene_stepwise_endpoint(
 
     scene = compose_scene(shell, generated, placements, background_mesh=background_geom)
     stats["scene"] = scene_statistics(scene, placements)
-    add_stage("final", "9. Final assembled scene",
+    add_stage("final", "Final assembled scene",
               f"{len(kept_ids)} of {len(instances)} detected objects placed and composed "
               "with the inpainted background into one scene graph.",
               type="glb", glb_base64=glb_b64(scene))
@@ -1349,6 +1371,7 @@ async def scene_tier4_endpoint(
     plane_threshold: float = Form(0.03),
     background_mode: str = Form("depth"),
     vlm_model: str = Form(""),
+    generator: str = Form("triposr"),
 ):
     """Tier 4: VLM-driven object discovery, otherwise identical to Tier 2.
 
@@ -1368,7 +1391,7 @@ async def scene_tier4_endpoint(
 
     rejected = []
     api_key = globals().get("OPENROUTER_API_KEY", "")
-    instances, vlm_stats = run_vlm_segmentation(
+    instances, vlm_stats, _vlm_debug = run_vlm_segmentation(
         image, depth_result.depth, api_key, max_objects=max_objects,
         vlm_model=(vlm_model or None), rejections=rejected,
     )
@@ -1396,7 +1419,8 @@ async def scene_tier4_endpoint(
                            RansacParams(distance_threshold=float(plane_threshold)))
     stats["room_shell"] = shell.stats
 
-    generated = generate_object_meshes(image, instances, depth_result.depth)
+    generated = generate_object_meshes(image, instances, depth_result.depth,
+                                       generator=generator)
     stats["generation"] = [
         {"instance_id": g.instance_id,
          "label": g.crop.meta.get("semantic_label"),
@@ -1408,7 +1432,15 @@ async def scene_tier4_endpoint(
 
     try:
         t0 = time.time()
-        placements = place_objects(generated, instances, depth_result.depth, cam, shell)
+        # TripoSG-generated objects don't get the calibrated rotation mode:
+        # that default assumes TripoSR's own verified output-frame constant
+        # (TRIPOSR_TO_SCENE), which has no reason to hold for a differently
+        # architected generator and hasn't been checked against one. The
+        # search-based "upright" mode makes no such assumption.
+        placement_params = (PlacementParams(rotation_mode="upright")
+                            if generator == "triposg" else PlacementParams())
+        placements = place_objects(generated, instances, depth_result.depth, cam, shell,
+                                   params=placement_params)
         stats["placement"] = [p.summary() for p in placements]
         stats["placement_seconds"] = round(time.time() - t0, 2)
 
@@ -1473,11 +1505,13 @@ async def object_triposg_endpoint(
                 "try Object/Tier 1/Tier 2/Stepwise instead."
             ),
         )
+    t0 = time.time()
     image = await read_image(file)
     mesh = generate_triposg_mesh(image, num_inference_steps, guidance_scale)
-    path = f"{OUT_DIR}/{uuid.uuid4()}.glb"
-    mesh.export(path)
-    return FileResponse(path, media_type="model/gltf-binary", filename="object.glb")
+    return {"glb_base64": glb_b64(mesh), "stats": {
+        "generator": "TripoSG", "faces": int(len(mesh.faces)),
+        "seconds": round(time.time() - t0, 2),
+    }}
 
 
 print("server defined —", len(app.routes), "routes")

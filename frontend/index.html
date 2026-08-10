@@ -31,6 +31,18 @@
   .mode-btn.active { background: #253059; border-color: #6d8bff; color: #fff; }
   .mode-btn b { display: block; font-size: 12px; }
 
+  /* Only shown for modes that actually take these options (Tier 4,
+     Stepwise) -- toggled in JS rather than left visible everywhere, since
+     TripoSR/Tier1/Tier2/Tier3/TripoSG have no use for either. */
+  #gen-options-row { display: none; flex-direction: column; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #26262c; }
+  #gen-choice { display: flex; align-items: center; gap: 6px; }
+  .opt-caption { font-size: 11px; color: #8a8a95; margin-right: 2px; }
+  .gen-btn { background: #1d1d22; border: 1px solid #2c2c34; color: #9a9aa5; padding: 6px 10px; border-radius: 7px; cursor: pointer; font-size: 11px; }
+  .gen-btn:hover { background: #26262e; }
+  .gen-btn.active { background: #253059; border-color: #6d8bff; color: #fff; }
+  #vlm-toggle-row { display: none; align-items: center; gap: 7px; font-size: 11px; color: #b6b6c2; cursor: pointer; }
+  #vlm-toggle-row input { accent-color: #6d8bff; }
+
   #chat-list { flex: 1; overflow-y: auto; padding: 10px; }
   .chat-item { display: flex; gap: 10px; padding: 10px; border-radius: 10px; cursor: pointer; margin-bottom: 8px; background: #1d1d22; align-items: center; position: relative; }
   .chat-item:hover { background: #26262e; }
@@ -141,6 +153,17 @@
   .stage-gallery-label { font-size: 12px; color: #ddd; margin-top: 6px; }
   .stage-gallery-warn { font-size: 10px; color: #ffb46b; margin-top: 4px; line-height: 1.4; }
 
+  /* Stepwise's VLM-object list: colour-coded by what actually happened to
+     each named object, so the reason it's in/out of the scene is visible
+     at a glance rather than requiring a click into stats JSON. */
+  .stage-list { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 720px; }
+  .stage-list-row { border-radius: 8px; padding: 10px 12px; border-left: 3px solid #444; background: #1a1a1f; }
+  .stage-list-row.stage-list-included { border-left-color: #4ad07a; }
+  .stage-list-row.stage-list-skipped { border-left-color: #ffb46b; }
+  .stage-list-row.stage-list-not-found { border-left-color: #ff6b6b; }
+  .stage-list-label { color: #eee; font-size: 13px; font-weight: 600; }
+  .stage-list-detail { color: #9a9aa5; font-size: 11.5px; margin-top: 3px; line-height: 1.4; }
+
   #stage-gallery3d-picker { display: none; position: absolute; top: 78px; left: 16px; right: 16px;
     z-index: 10; flex-wrap: wrap; gap: 6px; background: rgba(20,20,24,0.85); border: 1px solid #26262c;
     border-radius: 10px; padding: 8px; }
@@ -188,13 +211,25 @@
     </div>
 
     <div id="mode-row">
-      <button class="mode-btn" data-mode="object"><b>Object</b>v1 — one object</button>
+      <button class="mode-btn" data-mode="object"><b>TripoSR</b>single object</button>
       <button class="mode-btn active" data-mode="tier1"><b>Tier 1</b>whole scene</button>
       <button class="mode-btn" data-mode="tier2"><b>Tier 2</b>compositional</button>
       <button class="mode-btn" data-mode="stepwise"><b>Stepwise</b>see every stage</button>
       <button class="mode-btn" data-mode="tier3"><b>Tier 3</b>movable objects</button>
       <button class="mode-btn" data-mode="tier4"><b>Tier 4</b>VLM object discovery</button>
       <button class="mode-btn" data-mode="triposg"><b>TripoSG</b>test generator</button>
+    </div>
+
+    <div id="gen-options-row">
+      <div id="gen-choice">
+        <span class="opt-caption">Generator</span>
+        <button class="gen-btn active" data-generator="triposr">TripoSR</button>
+        <button class="gen-btn" data-generator="triposg">TripoSG</button>
+      </div>
+      <label id="vlm-toggle-row">
+        <input type="checkbox" id="useVlmToggle" />
+        Use VLM object discovery (Tier 4 style)
+      </label>
     </div>
 
     <div id="chat-list"></div>
@@ -901,6 +936,17 @@
       if (t1.seconds_mesh != null) html += row("meshing time", t1.seconds_mesh + "s");
       html += `</div>`;
     }
+    if (stats.generator && !stats.generation) {
+      // Standalone single-object modes (TripoSR / TripoSG) -- a flat
+      // {generator, resolution, faces, seconds} shape, distinct from the
+      // per-object array `stats.generation` the multi-object tiers use.
+      html += `<div class="grp"><h4>Generation</h4>`;
+      html += row("generator", stats.generator);
+      if (stats.resolution != null) html += row("resolution", stats.resolution);
+      if (stats.faces != null) html += row("triangles", Number(stats.faces).toLocaleString());
+      if (stats.seconds != null) html += row("time", stats.seconds + "s");
+      html += `</div>`;
+    }
     if (stats.segmentation) {
       const s = stats.segmentation;
       html += `<div class="grp"><h4>Segmentation</h4>` + row("objects kept", s.objects);
@@ -1082,6 +1128,24 @@
       });
       stagePanelEl.appendChild(grid);
       stagePanelEl.appendChild(caption);
+    } else if (stage.type === "list") {
+      const list = document.createElement("div");
+      list.className = "stage-list";
+      (stage.items || []).forEach((it) => {
+        const row = document.createElement("div");
+        row.className = "stage-list-row stage-list-" + (it.tag || "included");
+        const label = document.createElement("div");
+        label.className = "stage-list-label";
+        label.textContent = it.label || "(unnamed)";
+        const detail = document.createElement("div");
+        detail.className = "stage-list-detail";
+        detail.textContent = it.detail || "";
+        row.appendChild(label);
+        row.appendChild(detail);
+        list.appendChild(row);
+      });
+      stagePanelEl.appendChild(list);
+      stagePanelEl.appendChild(caption);
     }
     layoutPanels();
   }
@@ -1171,11 +1235,35 @@
   setInterval(refreshServerStatus, 30000);
 
   // ---------------- mode selector ----------------
+  // ---------------- generator / VLM options (Tier 4, Stepwise only) ----------------
+  let currentGenerator = "triposr";
+  let useVlmForStepwise = false;
+  const genOptionsRow = $("gen-options-row");
+  const vlmToggleRow = $("vlm-toggle-row");
+  const useVlmToggle = $("useVlmToggle");
+
+  function refreshGenOptionsVisibility() {
+    const relevant = currentMode === "tier4" || currentMode === "stepwise";
+    genOptionsRow.style.display = relevant ? "flex" : "none";
+    // Tier 4 is always VLM-driven by definition -- the toggle only makes
+    // sense where it's an actual choice, i.e. Stepwise.
+    vlmToggleRow.style.display = currentMode === "stepwise" ? "flex" : "none";
+  }
+
+  document.querySelectorAll(".gen-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      currentGenerator = btn.dataset.generator;
+      document.querySelectorAll(".gen-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    })
+  );
+  useVlmToggle.addEventListener("change", () => { useVlmForStepwise = useVlmToggle.checked; });
+
   document.querySelectorAll(".mode-btn").forEach((btn) =>
     btn.addEventListener("click", () => {
       currentMode = btn.dataset.mode;
       document.querySelectorAll(".mode-btn").forEach((b) => b.classList.toggle("active", b === btn));
       statusEl.textContent = `Mode: ${MODES[currentMode].label} — roughly ${MODES[currentMode].eta}.`;
+      refreshGenOptionsVisibility();
     })
   );
 
@@ -1195,7 +1283,8 @@
     const name = document.createElement("span");
     name.className = "name";
     const mode = record.mode || "object";
-    name.innerHTML = `<span class="badge ${mode}">${mode}</span>${record.filename || "image"}`;
+    const badgeLabel = mode === "object" ? "TripoSR" : mode;
+    name.innerHTML = `<span class="badge ${mode}">${badgeLabel}</span>${record.filename || "image"}`;
     const time = document.createElement("span");
     time.textContent = pending ? "Building…" : formatTime(record.timestamp);
     meta.appendChild(name); meta.appendChild(time);
@@ -1280,6 +1369,12 @@
 
     const formData = new FormData();
     formData.append("file", file);
+    if (currentMode === "tier4" || currentMode === "stepwise") {
+      formData.append("generator", currentGenerator);
+    }
+    if (currentMode === "stepwise") {
+      formData.append("use_vlm", useVlmForStepwise ? "1" : "0");
+    }
 
     try {
       const res = await fetch(`${API_BASE}${cfg.endpoint}`, { method: "POST", body: formData });

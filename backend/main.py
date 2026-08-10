@@ -319,13 +319,22 @@ def _decode_stepwise_response(resp, record_id: str) -> dict:
             items = []
             for it in stage["items"]:
                 item = {"id": it["id"], "label": it.get("label"),
-                        "error": it.get("error"), "faces": it.get("faces")}
+                        "error": it.get("error"), "faces": it.get("faces"),
+                        "seconds": it.get("seconds")}
                 if it.get("glb_base64"):
                     item["model_url"] = _save_b64_file(
                         it["glb_base64"], stage_dir, f"{sid}_{it['id']}.glb"
                     )
                 items.append(item)
             entry["items"] = items
+        elif stage["type"] == "list":
+            # Structured text, not an image/model -- e.g. the VLM object
+            # list, with no base64 asset to save to disk.
+            entry["items"] = [
+                {"label": it.get("label"), "detail": it.get("detail"),
+                 "tag": it.get("tag")}
+                for it in stage["items"]
+            ]
         elif stage["type"] == "glb":
             entry["model_url"] = _save_b64_file(
                 stage["glb_base64"], stage_dir, f"{sid}.glb"
@@ -367,14 +376,9 @@ async def convert(file: UploadFile = File(...)):
     "the main object" and "the whole scene".
     """
     record_id, image_name, image_path = _save_upload(file)
-    resp = _post_to_colab("/convert", image_path, {}, TIMEOUTS["convert"])
-
-    model_name = f"{record_id}.glb"
-    with open(os.path.join(MODELS_DIR, model_name), "wb") as f:
-        f.write(resp.content)
-
+    resp = _post_to_colab("/object", image_path, {}, TIMEOUTS["convert"])
     return _record(record_id, "object", file.filename, image_name,
-                   {"model_url": f"/files/models/{model_name}"})
+                   _decode_scene_response(resp, record_id))
 
 
 @app.post("/convert/triposg")
@@ -390,13 +394,8 @@ async def convert_triposg(file: UploadFile = File(...)):
     """
     record_id, image_name, image_path = _save_upload(file)
     resp = _post_to_colab("/object/triposg", image_path, {}, TIMEOUTS["convert"])
-
-    model_name = f"{record_id}.glb"
-    with open(os.path.join(MODELS_DIR, model_name), "wb") as f:
-        f.write(resp.content)
-
     return _record(record_id, "triposg", file.filename, image_name,
-                   {"model_url": f"/files/models/{model_name}"})
+                   _decode_scene_response(resp, record_id))
 
 
 @app.post("/scene/tier1")
@@ -497,6 +496,7 @@ async def scene_tier4(
     hfov_deg: float = Form(60.0),
     max_objects: int = Form(8),
     plane_threshold: float = Form(0.03),
+    generator: str = Form("triposr"),
 ):
     """VLM-driven object discovery, otherwise the same pipeline as Tier 2.
 
@@ -506,6 +506,9 @@ async def scene_tier4(
     objects like a bookshelf and its books into one mesh instead of many.
     If no key is configured or the call fails, Colab falls back to Tier 2's
     own SAM2+GroundingDINO detection rather than erroring out.
+
+    `generator` picks TripoSR (default) or TripoSG for the per-object
+    meshes; Colab reports 503 if TripoSG didn't load in that session.
     """
     record_id, image_name, image_path = _save_upload(file)
     resp = _post_to_colab(
@@ -515,6 +518,7 @@ async def scene_tier4(
             "hfov_deg": str(hfov_deg),
             "max_objects": str(max_objects),
             "plane_threshold": str(plane_threshold),
+            "generator": generator,
         },
         TIMEOUTS["tier4"],
     )
@@ -529,12 +533,18 @@ async def scene_stepwise(
     max_objects: int = Form(6),
     plane_threshold: float = Form(0.03),
     background_mode: str = Form("depth"),
+    use_vlm: bool = Form(False),
+    generator: str = Form("triposr"),
 ):
-    """Every stage of Tier 2 as its own inspectable artifact.
+    """Every stage of the pipeline as its own inspectable artifact.
 
-    Same pipeline as /scene/tier2, run once — this does not trade accuracy
-    for visibility, it just keeps what each stage produced instead of
-    discarding it once the next stage consumed it.
+    Same pipeline the real endpoints use, run once — this does not trade
+    accuracy for visibility, it just keeps what each stage produced instead
+    of discarding it once the next stage consumed it. `use_vlm` switches
+    object discovery to Tier 4's VLM-driven path (same switch /scene/tier4
+    makes) and adds real stages showing exactly what the VLM found, what
+    GroundingDINO could locate from it, and why anything was excluded.
+    `generator` picks TripoSR or TripoSG for the per-object meshes.
     """
     record_id, image_name, image_path = _save_upload(file)
     resp = _post_to_colab(
@@ -545,6 +555,8 @@ async def scene_stepwise(
             "max_objects": str(max_objects),
             "plane_threshold": str(plane_threshold),
             "background_mode": background_mode,
+            "use_vlm": "1" if use_vlm else "0",
+            "generator": generator,
         },
         TIMEOUTS["stepwise"],
     )
