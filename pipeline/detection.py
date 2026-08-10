@@ -211,6 +211,90 @@ def is_ambiguous_label(label: str, vocabulary: list[str] | None = None) -> bool:
     return matches > 1
 
 
+def detect_from_labels(
+    detector: "GroundingDinoDetector", image: Image.Image, labels: list[str]
+) -> dict[str, DetectedBox]:
+    """Run GroundingDINO once per label, for Tier 4's VLM-driven object list.
+
+    Every earlier tier prompts GroundingDINO with one fixed vocabulary
+    covering "furniture in general". Tier 4 instead prompts it once per
+    label a vision-language model actually named in *this* photo, which is
+    what lets it find things a generic vocabulary never listed at all. A
+    plain per-label loop rather than one big joined prompt, because a
+    joined prompt is exactly what produces the run-on fused labels
+    `is_ambiguous_label` exists to catch — asking one question at a time
+    keeps each answer attributable to the label that produced it.
+
+    Returns the best-scoring box per label; a label with no matching box
+    (the VLM named something GroundingDINO found no visual evidence for)
+    is simply absent from the result, not an error.
+    """
+    found: dict[str, DetectedBox] = {}
+    for label in labels:
+        prompt = label if label.endswith(".") else f"{label}."
+        candidates = detector.detect(image, prompt=prompt)
+        if candidates:
+            best = max(candidates, key=lambda d: d.score)
+            found[label] = DetectedBox(box=best.box, label=label, score=best.score)
+    return found
+
+
+@dataclass
+class GroupedDetection:
+    group: str
+    labels: list[str]
+    box: tuple[float, float, float, float]
+    wall_mounted: bool
+
+
+def group_detections(
+    scene_objects: list, boxes_by_label: dict[str, DetectedBox]
+) -> list[GroupedDetection]:
+    """Union per-label boxes into one box per VLM-assigned group.
+
+    `scene_objects` are `vlm_understanding.SceneObject`s (label, group,
+    wall_mounted); duck-typed here rather than imported to avoid a cycle,
+    since vlm_understanding has no reason to depend on detection. Members
+    of a group become one union bounding box, because they are meant to
+    become one combined 3D model downstream (a bookshelf and its books,
+    not a shelf and several floating books) — segmentation and meshing
+    should see them as a single region from here on.
+
+    A group is only emitted if at least one of its members was actually
+    detected; labels the detector found no evidence for simply drop out of
+    the group rather than pulling the whole group's box toward nothing.
+    """
+    by_group: dict[str, list[SceneObject_ish]] = {}
+    for obj in scene_objects:
+        by_group.setdefault(obj.group, []).append(obj)
+
+    grouped: list[GroupedDetection] = []
+    for group, members in by_group.items():
+        boxes = [boxes_by_label[m.label] for m in members if m.label in boxes_by_label]
+        if not boxes:
+            continue
+        x0 = min(b.box[0] for b in boxes)
+        y0 = min(b.box[1] for b in boxes)
+        x1 = max(b.box[2] for b in boxes)
+        y1 = max(b.box[3] for b in boxes)
+        wall_mounted = any(m.wall_mounted for m in members if m.label in boxes_by_label)
+        grouped.append(
+            GroupedDetection(
+                group=group,
+                labels=[b.label for b in boxes],
+                box=(x0, y0, x1, y1),
+                wall_mounted=wall_mounted,
+            )
+        )
+    return grouped
+
+
+# Duck-typed stand-in purely for the type hint above; any object with
+# .label/.group/.wall_mounted attributes (e.g. vlm_understanding.SceneObject)
+# satisfies group_detections without detection.py importing that module.
+SceneObject_ish = object
+
+
 def clip_box(box: tuple[float, float, float, float], width: int, height: int):
     x0, y0, x1, y1 = box
     return (

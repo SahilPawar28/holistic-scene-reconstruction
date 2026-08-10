@@ -39,6 +39,8 @@ one API for `backend/main.py` to call:
 | `POST /object`  | one pre-cropped object -> mesh (TripoSR) |
 | `POST /tier1`   | whole image -> one continuous scene mesh |
 | `POST /scene`   | Tier 2: shell + placed objects, one .glb |
+| `POST /scene/stepwise` | Tier 2, every stage as its own inspectable artifact |
+| `POST /scene/tier4` | Tier 4: VLM-driven object discovery (see cell 6 for the API key) |
 
 **One notebook, not two.** Free Colab gives you a single GPU session, so
 Depth Anything V2, SAM2 and TripoSR all live here together. That also means
@@ -47,15 +49,18 @@ of paying the load cost per call.
 
 ### Running it
 
-1. `Runtime` -> `Change runtime type` -> **T4 GPU**
-2. Run cell 1 (installs). Then **`Runtime` -> `Restart session`** — required
+1. Click the key icon in the left sidebar and add two Colab secrets (never
+   stored in this notebook or in git, just your own account):
+   `NGROK_AUTHTOKEN` (free, from https://dashboard.ngrok.com/get-started/your-authtoken)
+   and optionally `OPENROUTER_API_KEY` (free, from https://openrouter.ai/settings/keys
+   — only needed for Tier 4). Toggle notebook access on for both.
+2. `Runtime` -> `Change runtime type` -> **T4 GPU**
+3. Run cell 1 (installs). Then **`Runtime` -> `Restart session`** — required
    exactly once. TripoSR pins `numpy<2` while Colab ships packages built
    against numpy 2, so the environment is inconsistent until a restart.
-3. Run cells 2 onward in order.
-4. The last cell prints an ngrok URL. Paste it into the server field in the
+4. Run cells 2 onward in order.
+5. The last cell prints an ngrok URL. Paste it into the server field in the
    frontend (or into `backend/config.json`). Leave that cell running.
-
-Free ngrok token: https://dashboard.ngrok.com/get-started/your-authtoken
 """)
 
 code('''
@@ -218,6 +223,14 @@ def _has_module(name):
     except ImportError:
         return False
 
+
+def _module_has(name, attr):
+    import importlib
+    try:
+        return hasattr(importlib.import_module(name), attr)
+    except ImportError:
+        return False
+
 # Version marker. Checking for a symbol that only exists in the current
 # code is the only reliable way to know the pull worked — a stale copy
 # imports perfectly happily and just behaves like the old version.
@@ -241,6 +254,9 @@ _missing = [
         ("assembly gate v2 (0.45 relief)",
          hasattr(assembly, "PlacementParams")
          and assembly.PlacementParams().semantic_gate_relief >= 0.45),
+        ("pipeline.vlm_understanding (Tier 4)", _has_module("pipeline.vlm_understanding")),
+        ("detection.detect_from_labels (Tier 4)",
+         _module_has("pipeline.detection", "detect_from_labels")),
     ] if not present
 ]
 if _missing:
@@ -639,6 +655,110 @@ def generate_object_meshes(image, instances, depth_map, resolution=256, crops=No
     return generated
 
 
+def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
+                         vlm_model=None, rejections=None):
+    """VLM-driven object discovery for Tier 4.
+
+    Trusts the evidence chain differently than run_segmentation: a group
+    here already passed two independent checks before it ever reaches this
+    function -- the VLM named it as a real object in this specific photo,
+    and GroundingDINO found visual evidence for that exact label at a real
+    location. Re-running SAM2's automatic-pass geometric objecthood test
+    (looks_like_object -- compactness, depth standing out from its
+    surroundings) on top of that would risk re-rejecting exactly the kind
+    of object Tier 4 exists to stop losing: a low-contrast or partially
+    occluded item is precisely what fails a geometric heuristic despite
+    being obviously real. So only a minimal sanity filter runs here --
+    degenerate masks and duplicate/contained boxes -- not the full Tier 2
+    objecthood gate.
+
+    Falls back to run_segmentation (Tier 2's own SAM2+GroundingDINO path)
+    if no API key is configured or the VLM call fails, so a missing or
+    broken key degrades Tier 4 to Tier 2 rather than failing the scene
+    outright.
+    """
+    from pipeline import vlm_understanding
+    from pipeline.detection import DetectedBox, detect_from_labels, group_detections
+
+    if rejections is None:
+        rejections = []
+    vlm_stats = {"used": False}
+
+    scene_objects = None
+    if api_key:
+        try:
+            kwargs = {"model": vlm_model} if vlm_model else {}
+            scene_objects = vlm_understanding.understand_scene(image, api_key, **kwargs)
+            vlm_stats.update({
+                "used": True,
+                "objects_named": [
+                    {"label": o.label, "group": o.group, "wall_mounted": o.wall_mounted}
+                    for o in scene_objects
+                ],
+            })
+        except vlm_understanding.VLMError as exc:
+            vlm_stats["error"] = str(exc)
+            print(f"  VLM understanding failed, falling back to Tier 2 detection: {exc}")
+    else:
+        vlm_stats["error"] = "no OPENROUTER_API_KEY configured"
+
+    if not scene_objects:
+        instances = run_segmentation(image, depth_map, max_objects, rejections=rejections)
+        vlm_stats["fallback"] = "tier2 segmentation"
+        return instances, vlm_stats
+
+    labels = [o.label for o in scene_objects]
+    boxes_by_label = detect_from_labels(detector, image, labels)
+    vlm_stats["labels_detected"] = sorted(boxes_by_label.keys())
+    vlm_stats["labels_not_found"] = sorted(set(labels) - set(boxes_by_label.keys()))
+
+    groups = group_detections(scene_objects, boxes_by_label)
+    kept_groups = [g for g in groups if not g.wall_mounted]
+    vlm_stats["groups"] = [
+        {"group": g.group, "labels": g.labels, "wall_mounted": g.wall_mounted}
+        for g in groups
+    ]
+    vlm_stats["wall_mounted_skipped"] = [g.group for g in groups if g.wall_mounted]
+
+    if not kept_groups:
+        instances = run_segmentation(image, depth_map, max_objects, rejections=rejections)
+        vlm_stats["fallback"] = "no non-wall-mounted groups detected"
+        return instances, vlm_stats
+
+    group_boxes = [
+        DetectedBox(box=g.box,
+                   label=g.labels[0] if len(g.labels) == 1 else " + ".join(g.labels),
+                   score=1.0)
+        for g in kept_groups
+    ]
+    instances = segmentation.instances_from_detections(image, group_boxes, segmenter.predictor)
+
+    # Minimal sanity filter only -- see docstring for why the full Tier 2
+    # objecthood gate is deliberately skipped here.
+    kept = []
+    for inst in sorted(instances, key=lambda i: i.area, reverse=True):
+        if inst.area < 64:
+            rejections.append((inst, "degenerate mask from box-prompted SAM2"))
+            continue
+        redundant = False
+        for other in kept:
+            if (segmentation.containment(inst.mask, other.mask) >= 0.85
+                    or segmentation.mask_iou(inst.mask, other.mask) >= 0.6):
+                redundant = True
+                break
+        if not redundant:
+            kept.append(inst)
+
+    for inst in kept[max_objects:]:
+        rejections.append((inst, "ranked below the cap on objects to generate"))
+    kept = kept[:max_objects]
+    for new_id, inst in enumerate(kept):
+        inst.id = new_id
+
+    segmentation.attach_depth_stats(kept, depth_map)
+    return kept, vlm_stats
+
+
 def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, seed=0):
     """One image -> one mesh via TripoSG. Deliberately mirrors /object's
     contract (TripoSR) exactly, so the two can be compared on the identical
@@ -693,7 +813,8 @@ async def read_image(file: UploadFile) -> Image.Image:
 
 @app.get("/health")
 def health():
-    endpoints = ["/depth", "/segment", "/object", "/tier1", "/scene", "/scene/stepwise"]
+    endpoints = ["/depth", "/segment", "/object", "/tier1", "/scene", "/scene/stepwise",
+                "/scene/tier3", "/scene/tier4"]
     models = {
         "depth": depth_model.checkpoint,
         "segmentation": segmenter.checkpoint,
@@ -702,6 +823,8 @@ def health():
     if triposg_pipe is not None:
         models["generation_experimental"] = "VAST-AI/TripoSG"
         endpoints.append("/object/triposg")
+    models["tier4_vlm"] = ("configured" if globals().get("OPENROUTER_API_KEY")
+                           else "not configured — /scene/tier4 falls back to Tier 2")
     return {"status": "ok", "device": DEVICE, "models": models, "endpoints": endpoints}
 
 
@@ -1064,6 +1187,117 @@ async def scene_stepwise_endpoint(
     return {"stages": stages, "stats": json_safe(stats)}
 
 
+@app.post("/scene/tier4")
+async def scene_tier4_endpoint(
+    file: UploadFile = File(...),
+    hfov_deg: float = Form(60.0),
+    max_objects: int = Form(8),
+    plane_threshold: float = Form(0.03),
+    background_mode: str = Form("depth"),
+    vlm_model: str = Form(""),
+):
+    """Tier 4: VLM-driven object discovery, otherwise identical to Tier 2.
+
+    The only thing that changes versus /scene is where the object list
+    comes from -- see run_vlm_segmentation. Placement, background fill and
+    scene composition below are the exact same calls /scene makes, because
+    grouping (a bookshelf and its books becoming one crop, one mesh, one
+    placement) already happened upstream, in run_vlm_segmentation, not here.
+    """
+    image = await read_image(file)
+    stats = {"mode": "tier4"}
+
+    tier1_mesh, tier1_stats, depth_png, depth_result, cam = run_tier1(
+        image, hfov_deg=hfov_deg
+    )
+    stats["tier1"] = tier1_stats
+
+    rejected = []
+    api_key = globals().get("OPENROUTER_API_KEY", "")
+    instances, vlm_stats = run_vlm_segmentation(
+        image, depth_result.depth, api_key, max_objects=max_objects,
+        vlm_model=(vlm_model or None), rejections=rejected,
+    )
+    stats["vlm_understanding"] = vlm_stats
+    stats["segmentation"] = {
+        "objects": len(instances),
+        "instances": [
+            {"id": i.id, "area": i.area, "bbox": list(i.bbox),
+             "depth_median": round(float(i.depth_median), 3),
+             "label": i.meta.get("semantic_label"),
+             "confidence": i.meta.get("semantic_confidence")}
+            for i in instances
+        ],
+        "rejected": [
+            {"area": i.area, "bbox": list(i.bbox), "reason": why}
+            for i, why in rejected[:12]
+        ],
+    }
+    overlay = mask_overlay(image, instances)
+
+    bg = background_mask(instances, depth_result.depth.shape)
+    bg_cloud = backproject_mask(bg, depth_result.depth, cam, max_points=60000,
+                                depth_percentile_trim=None)
+    shell = fit_room_shell(bg_cloud, image, cam,
+                           RansacParams(distance_threshold=float(plane_threshold)))
+    stats["room_shell"] = shell.stats
+
+    generated = generate_object_meshes(image, instances, depth_result.depth)
+    stats["generation"] = [
+        {"instance_id": g.instance_id,
+         "label": g.crop.meta.get("semantic_label"),
+         "crop_quality": g.crop.meta.get("crop_quality"),
+         "crop_warnings": g.crop.meta.get("crop_warnings"),
+         **g.meta}
+        for g in generated
+    ]
+
+    try:
+        t0 = time.time()
+        placements = place_objects(generated, instances, depth_result.depth, cam, shell)
+        stats["placement"] = [p.summary() for p in placements]
+        stats["placement_seconds"] = round(time.time() - t0, 2)
+
+        kept_ids = kept_instance_ids(placements)
+        kept_instances = [i for i in instances if i.id in kept_ids]
+        stats["quality_gate"] = {
+            "kept": sorted(kept_ids),
+            "rejected": [
+                {"instance_id": p.instance_id, "reason": p.status,
+                 "coverage": round(float(p.coverage), 3)}
+                for p in placements if not p.ok
+            ],
+        }
+
+        background_geom = None
+        if background_mode in ("depth", "auto"):
+            occupied = occupancy_mask(instances, depth_result.depth.shape)
+            inpainted_image, inpainted_depth = inpaint_background(
+                image, depth_result.depth, occupied
+            )
+            background_geom = depth_to_mesh(
+                inpainted_image, inpainted_depth, cam,
+                MeshingParams(max_grid_side=480),
+            ).mesh
+            stats["background"] = {"mode": "depth-mesh-inpainted",
+                                   "faces": int(len(background_geom.faces)),
+                                   "inpainted_for": sorted(i.id for i in instances),
+                                   "mesh_placed_for": sorted(kept_ids)}
+        else:
+            stats["background"] = {"mode": "fitted-planes"}
+
+        scene = compose_scene(shell, generated, placements,
+                              background_mesh=background_geom)
+        stats["scene"] = scene_statistics(scene, placements)
+        glb = glb_b64(scene)
+    except Exception:
+        stats["placement_error"] = traceback.format_exc(limit=4)
+        glb = glb_b64(tier1_mesh)
+
+    return {"glb_base64": glb, "depth_png_base64": png_b64(depth_png),
+            "overlay_png_base64": png_b64(overlay), "stats": json_safe(stats)}
+
+
 @app.post("/object/triposg")
 async def object_triposg_endpoint(
     file: UploadFile = File(...),
@@ -1096,10 +1330,52 @@ print("server defined —", len(app.routes), "routes")
 ''')
 
 code('''
-# --- Cell 6: expose it. Paste your ngrok token, run, copy the printed URL
-# --- into the frontend's server field. Leave this cell running.
+# --- Cell 6: expose it. Run this, copy the printed URL into the frontend's
+# --- server field. Leave this cell running.
+#
+# Both secrets below are read from Colab's own per-account Secrets manager
+# (the key icon in the left sidebar) rather than pasted here as plain text.
+# This notebook is tracked in git and pushed to a public GitHub repo -- a
+# real token pasted directly into this cell would get pushed right along
+# with it, and a public repo is exactly the kind of place bots scrape for
+# exactly that. Colab Secrets never touch the notebook file or git; set
+# each one once (NGROK_AUTHTOKEN, OPENROUTER_API_KEY) and every future run
+# of this cell picks it up automatically, no re-pasting.
+#
+#   1. Click the key icon in the left sidebar.
+#   2. Add a secret named NGROK_AUTHTOKEN, value from
+#      https://dashboard.ngrok.com/get-started/your-authtoken
+#   3. Add a secret named OPENROUTER_API_KEY (optional -- only needed for
+#      Tier 4), value from https://openrouter.ai/settings/keys
+#   4. Toggle "Notebook access" on for both.
 
-NGROK_AUTHTOKEN = "PASTE_YOUR_TOKEN_HERE"
+from google.colab import userdata
+
+
+def _secret(name: str) -> str:
+    try:
+        return userdata.get(name) or ""
+    except Exception:
+        return ""
+
+
+NGROK_AUTHTOKEN = _secret("NGROK_AUTHTOKEN")
+# Only needed for Tier 4 (VLM-driven object discovery); leave the Colab
+# secret unset to skip it -- /scene/tier4 then automatically falls back to
+# Tier 2's own SAM2+GroundingDINO detection instead of failing outright.
+OPENROUTER_API_KEY = _secret("OPENROUTER_API_KEY")
+
+if not NGROK_AUTHTOKEN:
+    raise SystemExit(
+        "No NGROK_AUTHTOKEN secret found. Click the key icon in the left "
+        "sidebar, add a secret named NGROK_AUTHTOKEN with your token from "
+        "https://dashboard.ngrok.com/get-started/your-authtoken, toggle "
+        "notebook access on, then re-run this cell."
+    )
+if not OPENROUTER_API_KEY:
+    print("No OPENROUTER_API_KEY secret set -- Tier 4 will fall back to "
+          "Tier 2's detection. Add one (see the comment above this cell) "
+          "if you want the VLM step.")
 
 import nest_asyncio, uvicorn
 from pyngrok import ngrok

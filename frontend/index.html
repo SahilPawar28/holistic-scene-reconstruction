@@ -21,8 +21,12 @@
   #serverDot.ok { background: #4ad07a; }
   #serverDot.bad { background: #ff6b6b; }
 
-  #mode-row { display: flex; gap: 6px; padding: 10px 12px; border-bottom: 1px solid #26262c; }
-  .mode-btn { flex: 1; background: #1d1d22; border: 1px solid #2c2c34; color: #9a9aa5; padding: 8px 4px; border-radius: 8px; cursor: pointer; font-size: 11px; text-align: center; line-height: 1.35; }
+  /* flex-wrap + a percentage basis rather than plain flex:1, so seven+
+     buttons wrap onto extra rows instead of being squeezed unreadably
+     thin into one — the failure mode this had before Tier 4 added a
+     seventh button to a row sized for six. */
+  #mode-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; border-bottom: 1px solid #26262c; }
+  .mode-btn { flex: 1 1 30%; background: #1d1d22; border: 1px solid #2c2c34; color: #9a9aa5; padding: 8px 4px; border-radius: 8px; cursor: pointer; font-size: 11px; text-align: center; line-height: 1.35; }
   .mode-btn:hover { background: #26262e; }
   .mode-btn.active { background: #253059; border-color: #6d8bff; color: #fff; }
   .mode-btn b { display: block; font-size: 12px; }
@@ -42,6 +46,7 @@
   .badge.stepwise { background: #3a2a5c; color: #d1a9ff; }
   .badge.triposg { background: #4a3320; color: #ffb870; }
   .badge.tier3 { background: #1f4a38; color: #7fe0b8; }
+  .badge.tier4 { background: #4a1f3a; color: #ff9fd6; }
 
   /* Tier 3: object picking + move/rotate gizmo panel */
   #tier3-panel { display: none; position: absolute; top: 78px; left: 16px; z-index: 10;
@@ -188,6 +193,7 @@
       <button class="mode-btn" data-mode="tier2"><b>Tier 2</b>compositional</button>
       <button class="mode-btn" data-mode="stepwise"><b>Stepwise</b>see every stage</button>
       <button class="mode-btn" data-mode="tier3"><b>Tier 3</b>movable objects</button>
+      <button class="mode-btn" data-mode="tier4"><b>Tier 4</b>VLM object discovery</button>
       <button class="mode-btn" data-mode="triposg"><b>TripoSG</b>test generator</button>
     </div>
 
@@ -339,7 +345,7 @@
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/DragControls.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
 <script>
-  const API_BASE = "http://localhost:8000"; // point this at your deployed backend
+  const API_BASE = "http://localhost:8001"; // point this at your deployed backend
 
   const MODES = {
     object: { endpoint: "/convert",     label: "single object (TripoSR)",       eta: "10–30s" },
@@ -350,6 +356,10 @@
     // the difference is entirely in the viewer, which lets objects in a
     // tier3-mode scene be picked up and moved/rotated freely afterward.
     tier3: { endpoint: "/scene/tier3", label: "compositional scene, objects movable", eta: "2–10 min" },
+    // Same shape of result as Tier 2 (room shell + placed objects, one
+    // .glb) -- the difference is entirely upstream, in how Colab decides
+    // what the objects even are. See pipeline/vlm_understanding.py.
+    tier4: { endpoint: "/scene/tier4", label: "VLM-driven object discovery", eta: "2–10 min" },
     // Standalone generator comparison, not part of the Tier 1/2/3 pipeline —
     // same one-object-in-one-mesh-out contract as "Object" mode, but through
     // TripoSG instead of TripoSR, so the two can be judged on identical
@@ -402,9 +412,39 @@
    */
   function layoutPanels() {
     const bar = $("topbar").getBoundingClientRect().height;
-    const top = 16 + bar + 10 + "px";
-    comparePanel.style.top = top;
-    statsPanel.style.top = top;
+    const top = 16 + bar + 10;
+    const topPx = top + "px";
+    comparePanel.style.top = topPx;
+    statsPanel.style.top = topPx;
+
+    // stage-bar, the gallery3d picker, and the tier3 move/rotate panel were
+    // all hard-coded to the same top offset as the topbar itself, which
+    // only happened to look right as long as the topbar never wrapped onto
+    // a second row. Position them the same measured way comparePanel and
+    // statsPanel already are, so a wrapped toolbar pushes everything below
+    // it down instead of sitting on top of it.
+    const stageBar = $("stage-bar"), stageG3d = $("stage-gallery3d-picker"),
+          tier3Panel = $("tier3-panel");
+    if (stageBar) stageBar.style.top = topPx;
+    if (stageG3d) stageG3d.style.top = topPx;
+    if (tier3Panel) tier3Panel.style.top = topPx;
+
+    // stage-panel sits below whichever of stage-bar / the gallery3d picker
+    // is actually showing right now -- both can themselves wrap onto extra
+    // rows depending on how many stages/objects there are, so this is
+    // measured too rather than assumed to fit on one line.
+    const stagePanel = $("stage-panel");
+    if (stagePanel) {
+      let secondBarHeight = 0;
+      if (stageBar && stageBar.style.display !== "none") {
+        secondBarHeight = stageBar.getBoundingClientRect().height;
+      } else if (stageG3d && stageG3d.style.display !== "none") {
+        secondBarHeight = stageG3d.getBoundingClientRect().height;
+      }
+      stagePanel.style.top = secondBarHeight
+        ? (top + secondBarHeight + 10) + "px"
+        : topPx;
+    }
   }
 
   function resizeRenderer() {
@@ -594,7 +634,8 @@
   // objects, not yet placed, and are loaded with an explicit {mode:"object"}
   // override rather than the record itself, so they still get orbit framing.
   function isSceneMode(mode) {
-    return mode === "tier1" || mode === "tier2" || mode === "stepwise" || mode === "tier3";
+    return mode === "tier1" || mode === "tier2" || mode === "stepwise" || mode === "tier3"
+      || mode === "tier4";
   }
 
   function prepareMaterials(root) {
@@ -899,6 +940,7 @@
       btn.addEventListener("click", () => showStage(record, stage));
       stageBarEl.appendChild(btn);
     });
+    layoutPanels();
     const startStage = record.stages.find((s) => s.id === "final") || record.stages[0];
     if (startStage) showStage(record, startStage);
   }
@@ -982,6 +1024,7 @@
       stagePanelEl.appendChild(grid);
       stagePanelEl.appendChild(caption);
     }
+    layoutPanels();
   }
 
   /**
@@ -1019,6 +1062,7 @@
       stageG3dPickerEl.appendChild(btn);
     });
 
+    layoutPanels();
     if (firstUsable && firstUsable.model_url) {
       loadModelFromUrl(API_BASE + firstUsable.model_url, { mode: "object" });
     } else {

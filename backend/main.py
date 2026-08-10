@@ -67,7 +67,7 @@ DEFAULT_COLAB_URL = os.environ.get("COLAB_SERVER_URL", "")
 # Stepwise runs the identical pipeline plus encodes every intermediate
 # artifact to base64, which costs real time on a slow tunnel — budgeted
 # generously rather than have a demo run die two minutes from the end.
-TIMEOUTS = {"convert": 300, "tier1": 420, "tier2": 1200, "stepwise": 1500}
+TIMEOUTS = {"convert": 300, "tier1": 420, "tier2": 1200, "stepwise": 1500, "tier4": 1500}
 
 
 def load_config() -> dict:
@@ -477,6 +477,37 @@ async def scene_tier3(
         TIMEOUTS["tier2"],
     )
     return _record(record_id, "tier3", file.filename, image_name,
+                   _decode_scene_response(resp, record_id))
+
+
+@app.post("/scene/tier4")
+async def scene_tier4(
+    file: UploadFile = File(...),
+    hfov_deg: float = Form(60.0),
+    max_objects: int = Form(8),
+    plane_threshold: float = Form(0.03),
+):
+    """VLM-driven object discovery, otherwise the same pipeline as Tier 2.
+
+    A vision-language model (see colab/scene_pipeline.ipynb cell 6 for the
+    OpenRouter key) lists every object in the photo and how they group —
+    catching things a fixed detector vocabulary misses, and combining
+    objects like a bookshelf and its books into one mesh instead of many.
+    If no key is configured or the call fails, Colab falls back to Tier 2's
+    own SAM2+GroundingDINO detection rather than erroring out.
+    """
+    record_id, image_name, image_path = _save_upload(file)
+    resp = _post_to_colab(
+        "/scene/tier4",
+        image_path,
+        {
+            "hfov_deg": str(hfov_deg),
+            "max_objects": str(max_objects),
+            "plane_threshold": str(plane_threshold),
+        },
+        TIMEOUTS["tier4"],
+    )
+    return _record(record_id, "tier4", file.filename, image_name,
                    _decode_scene_response(resp, record_id))
 
 
