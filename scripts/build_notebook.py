@@ -1117,7 +1117,7 @@ async def scene_endpoint(
             )
             background_geom = depth_to_mesh(
                 inpainted_image, inpainted_depth, cam,
-                MeshingParams(max_grid_side=480),
+                MeshingParams(max_grid_side=480, colourless=True),
             ).mesh
             stats["background"] = {"mode": "depth-mesh-inpainted",
                                    "faces": int(len(background_geom.faces)),
@@ -1348,7 +1348,8 @@ async def scene_stepwise_endpoint(
               after_base64=png_b64(resize_max(inpainted_image)))
 
     background_geom = depth_to_mesh(
-        inpainted_image, inpainted_depth, cam, MeshingParams(max_grid_side=480)
+        inpainted_image, inpainted_depth, cam,
+        MeshingParams(max_grid_side=480, colourless=True),
     ).mesh
     stats["background"] = {"faces": int(len(background_geom.faces)),
                            "mesh_placed_for": sorted(kept_ids)}
@@ -1463,7 +1464,7 @@ async def scene_tier4_endpoint(
             )
             background_geom = depth_to_mesh(
                 inpainted_image, inpainted_depth, cam,
-                MeshingParams(max_grid_side=480),
+                MeshingParams(max_grid_side=480, colourless=True),
             ).mesh
             stats["background"] = {"mode": "depth-mesh-inpainted",
                                    "faces": int(len(background_geom.faces)),

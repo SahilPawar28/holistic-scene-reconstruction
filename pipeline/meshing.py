@@ -59,6 +59,12 @@ class MeshingParams:
     # Bilateral-filter the depth before meshing. Removes upsampling ripple.
     smooth_depth: bool = True
 
+    # Skip baking the photo in as a texture; render a plain white surface
+    # instead. UVs are still computed (harmless, unused) rather than
+    # branched around, keeping this a one-line difference in the material
+    # rather than two divergent code paths.
+    colourless: bool = False
+
 
 @dataclass
 class Tier1Result:
@@ -266,7 +272,8 @@ def depth_to_mesh(
     vertices, uv, faces = prune_unused_vertices(vertices, uv, faces)
 
     material = trimesh.visual.material.PBRMaterial(
-        baseColorTexture=img,
+        baseColorTexture=None if params.colourless else img,
+        baseColorFactor=[255, 255, 255, 255] if params.colourless else None,
         metallicFactor=0.0,
         roughnessFactor=1.0,
         # Depth-map meshes have plenty of holes where triangles were culled;
