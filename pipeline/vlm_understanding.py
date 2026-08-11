@@ -24,9 +24,17 @@ hallucinates coordinates that do not line up with the actual object. So
 this module never asks it for one. Its only output is a structured object
 list (label, group, flat_surface) — the *semantic* judgement calls a box
 detector cannot make. The actual boxes still come from GroundingDINO,
-called once per label the VLM names instead of a fixed vocabulary; see
-`pipeline.detection`. This keeps each model doing the part it is reliable
-at.
+queried with the VLM's own open-vocabulary labels instead of a fixed list;
+see `pipeline.detection`. This keeps each model doing the part it is
+reliable at.
+
+GroundingDINO's returned label for a box is its own phrase grounding, which
+often differs in wording from the VLM's exact label text for the same
+physical object ("armchair" vs. "brown leather armchair") -- a literal
+string match between the two would silently lose objects GroundingDINO
+actually found and boxed correctly, purely over wording. `reconcile_labels`
+below handles that mismatch with a second, lightweight text-only model call
+rather than a rigid lookup.
 """
 
 from __future__ import annotations
@@ -41,6 +49,13 @@ from dataclasses import dataclass
 from PIL import Image
 
 DEFAULT_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
+# Text-only, no image -- used only to reconcile GroundingDINO's own detection
+# labels against the VLM's object list (see reconcile_labels). A vision model
+# isn't needed for that job, and this one is free, real (verified on
+# OpenRouter as nvidia/nemotron-3-super-120b-a12b:free), and separate from
+# the vision call above so a slow/failing comparison doesn't compete with or
+# block scene understanding.
+DEFAULT_COMPARISON_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 # The free endpoint documents a 1024x1024 max input resolution; sending
@@ -144,9 +159,24 @@ def _parse_objects(raw: list) -> list[SceneObject]:
 
 
 def _call_openrouter(
-    image_b64: str, api_key: str, model: str, endpoint: str, prompt: str, timeout: float
+    image_b64: str | None, api_key: str, model: str, endpoint: str, prompt: str, timeout: float,
+    max_tokens: int = 3000,
 ) -> str:
+    """POST one chat completion to OpenRouter.
+
+    `image_b64` is None for a text-only request (label reconciliation
+    doesn't need the photo, just two lists of strings) -- content is then
+    a plain string instead of the multimodal text+image_url block.
+    """
     import requests
+
+    content = (
+        prompt if image_b64 is None
+        else [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]
+    )
 
     try:
         resp = requests.post(
@@ -164,25 +194,14 @@ def _call_openrouter(
             },
             json={
                 "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                            },
-                        ],
-                    }
-                ],
+                "messages": [{"role": "user", "content": content}],
                 "temperature": 0.0,
                 # A room with 15-20 objects needs real room for the reply.
                 # Without an explicit cap the default can be small enough to
                 # truncate the JSON array mid-object, which then fails to
                 # parse and looks like "the VLM is broken" when it was
                 # actually just cut off.
-                "max_tokens": 3000,
+                "max_tokens": max_tokens,
             },
             timeout=timeout,
         )
@@ -231,13 +250,14 @@ def _is_transient(exc: VLMError) -> bool:
 
 
 def _call_with_retries(
-    image_b64: str, api_key: str, model: str, endpoint: str, prompt: str, timeout: float,
-    max_attempts: int = 3, backoff_seconds: float = 4.0,
+    image_b64: str | None, api_key: str, model: str, endpoint: str, prompt: str, timeout: float,
+    max_attempts: int = 3, backoff_seconds: float = 4.0, max_tokens: int = 3000,
 ) -> str:
     last_exc: VLMError | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return _call_openrouter(image_b64, api_key, model, endpoint, prompt, timeout)
+            return _call_openrouter(image_b64, api_key, model, endpoint, prompt, timeout,
+                                    max_tokens=max_tokens)
         except VLMError as exc:
             last_exc = exc
             if attempt == max_attempts or not _is_transient(exc):
@@ -281,3 +301,98 @@ def understand_scene(
     if not objects:
         raise VLMError(f"VLM reply parsed but contained no usable objects: {parsed!r}")
     return objects
+
+
+_RECONCILE_PROMPT_TEMPLATE = """You are matching two lists of object names that both describe the SAME photo of a room.
+
+List A -- named by a vision-language model:
+{a_list}
+
+List B -- named by a separate object detector, which may use different
+wording for the same physical objects (e.g. "armchair" instead of "brown
+leather armchair"), or may include things List A didn't separately name:
+{b_list}
+
+For each item in List A, decide whether any item in List B refers to the
+SAME physical object, just possibly worded differently. Do not match two
+different physical objects just because they are the same general category
+(a "wooden dining chair" and a "office chair" are NOT the same object even
+though both are chairs).
+
+Respond with ONLY a JSON array, one entry per List A item, in this exact
+form: [{{"a": "<List A item, verbatim>", "b": "<matching List B item,
+verbatim, or null if none of them refer to the same object>"}}]. No
+markdown fences, no prose before or after, just the JSON array."""
+
+_RECONCILE_STRICT_REMINDER = (
+    "\n\nYour previous reply was not valid JSON. Reply again with ONLY the "
+    "JSON array, nothing else."
+)
+
+
+def reconcile_labels(
+    a_labels: list[str],
+    b_labels: list[str],
+    api_key: str,
+    model: str = DEFAULT_COMPARISON_MODEL,
+    endpoint: str = DEFAULT_ENDPOINT,
+    timeout: float = 60.0,
+) -> dict[str, str | None]:
+    """Match VLM object labels (A) against GroundingDINO detection labels (B)
+    that refer to the same physical object, worded differently.
+
+    This exists because GroundingDINO is queried with the VLM's own labels
+    as the detection prompt -- open-vocabulary, not a fixed list -- but
+    GroundingDINO's returned label for a matched box is its own phrase
+    grounding, which routinely differs in wording from the VLM's exact
+    label text. A literal string match then misses objects GroundingDINO
+    genuinely found and boxed correctly, purely because the two labels for
+    the same physical thing were worded differently. This call can only
+    reconcile boxes GroundingDINO already found; it cannot invent a
+    detection for something GroundingDINO never located at all -- that is
+    a detector limitation this step is not meant to paper over.
+
+    Text-only (no image) and deliberately a separate, non-vision model
+    (DEFAULT_COMPARISON_MODEL) from the one that does the actual scene
+    understanding -- this is a much lighter task than looking at a photo.
+
+    Returns {a_label: matching_b_label_or_None} for every label in
+    `a_labels`. Raises VLMError on request/parse failure (after retrying
+    transient errors) -- callers should treat that as "reconciliation
+    unavailable" and fall back to whatever direct matches they already had,
+    the same way understand_scene's own callers fall back to Tier 2.
+    """
+    if not api_key:
+        raise VLMError("no OpenRouter API key configured")
+    if not a_labels:
+        return {}
+
+    a_list = "\n".join(f"- {a}" for a in a_labels)
+    b_list = "\n".join(f"- {b}" for b in b_labels) if b_labels else "(empty -- nothing detected)"
+    prompt = _RECONCILE_PROMPT_TEMPLATE.format(a_list=a_list, b_list=b_list)
+
+    content = _call_with_retries(None, api_key, model, endpoint, prompt, timeout,
+                                 max_tokens=1500)
+    parsed = _extract_json_array(content)
+    if parsed is None:
+        content = _call_with_retries(None, api_key, model, endpoint,
+                                     prompt + _RECONCILE_STRICT_REMINDER, timeout,
+                                     max_tokens=1500)
+        parsed = _extract_json_array(content)
+    if parsed is None:
+        raise VLMError(f"could not parse a JSON array from the reconciliation reply: {content[:500]!r}")
+
+    mapping: dict[str, str | None] = {a: None for a in a_labels}
+    b_set = set(b_labels)
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        a = str(item.get("a", "")).strip()
+        b = item.get("b")
+        b = str(b).strip() if b else None
+        # Only trust a match that names something actually in List B --
+        # a hallucinated "b" value that isn't one of the real detections
+        # would silently attach the wrong box to this label downstream.
+        if a in mapping and b in b_set:
+            mapping[a] = b
+    return mapping

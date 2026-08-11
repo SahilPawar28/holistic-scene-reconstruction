@@ -717,7 +717,7 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
     ignores this third value.
     """
     from pipeline import vlm_understanding
-    from pipeline.detection import DetectedBox, detect_from_labels, group_detections
+    from pipeline.detection import DetectedBox, group_detections
 
     if rejections is None:
         rejections = []
@@ -749,10 +749,70 @@ def run_vlm_segmentation(image, depth_map, api_key, max_objects=8,
         return instances, vlm_stats, debug
 
     labels = [o.label for o in scene_objects]
-    boxes_by_label = detect_from_labels(detector, image, labels)
+    # One combined query with every VLM label, not one call per label: gives
+    # GroundingDINO the whole photo's context at once (same open-vocabulary
+    # prompting style Tier 2 already uses for its own fixed list, just built
+    # from the VLM's labels instead), and is one GPU pass instead of N.
+    all_detections = detector.detect(image, prompt=". ".join(labels) + ".")
+
+    def _norm(s):
+        return s.lower().strip(". ")
+
+    boxes_by_label = {}
+    # What GroundingDINO itself actually called each match, kept separate
+    # from boxes_by_label (which relabels every box with the VLM's own
+    # label so downstream grouping/placement code only ever sees one naming
+    # scheme) -- purely so Stepwise can show the real wording a match was
+    # found under, e.g. "GroundingDINO called it 'armchair'".
+    detected_as = {}
+    unmatched_labels = []
+    for label in labels:
+        nl = _norm(label)
+        best = None
+        for det in all_detections:
+            nd = _norm(det.label)
+            if nd and (nd in nl or nl in nd) and (best is None or det.score > best.score):
+                best = det
+        if best is not None:
+            boxes_by_label[label] = DetectedBox(box=best.box, label=label, score=best.score)
+            detected_as[label] = best.label
+        else:
+            unmatched_labels.append(label)
+
+    # GroundingDINO's returned label for a box is its own phrase grounding,
+    # which often differs in wording from the VLM's exact label for the
+    # same physical object ("armchair" vs "brown leather armchair") -- the
+    # literal substring match above misses those. Reconcile the leftovers
+    # with a lightweight text-only model call instead of losing them to
+    # wording alone; this can only recover a box GroundingDINO actually
+    # found under different wording, not manufacture one it never located.
+    vlm_stats["labels_matched_directly"] = sorted(boxes_by_label.keys())
+    if unmatched_labels and all_detections:
+        try:
+            mapping = vlm_understanding.reconcile_labels(
+                unmatched_labels, [d.label for d in all_detections], api_key,
+            )
+            vlm_stats["llm_reconciliation"] = mapping
+            for vlm_label, det_label in mapping.items():
+                if det_label is None:
+                    continue
+                match = max(
+                    (d for d in all_detections if d.label == det_label),
+                    key=lambda d: d.score, default=None,
+                )
+                if match is not None:
+                    boxes_by_label[vlm_label] = DetectedBox(
+                        box=match.box, label=vlm_label, score=match.score
+                    )
+                    detected_as[vlm_label] = match.label
+        except vlm_understanding.VLMError as exc:
+            vlm_stats["llm_reconciliation_error"] = str(exc)
+
     debug["boxes_by_label"] = boxes_by_label
+    debug["detected_as"] = detected_as
     vlm_stats["labels_detected"] = sorted(boxes_by_label.keys())
     vlm_stats["labels_not_found"] = sorted(set(labels) - set(boxes_by_label.keys()))
+    vlm_stats["detected_as"] = detected_as
 
     groups = group_detections(scene_objects, boxes_by_label)
     debug["groups"] = groups
@@ -1204,14 +1264,27 @@ async def scene_stepwise_endpoint(
         groups = vlm_debug["groups"]
         group_flat = {g.group: g.flat_surface for g in groups}
 
+        matched_directly = set(vlm_stats.get("labels_matched_directly", []))
+        reconciled = vlm_stats.get("llm_reconciliation", {})
         list_items = []
         for o in scene_objects:
             if o.label not in boxes_by_label:
-                detail, tag = "named by the VLM, but GroundingDINO found no matching box in the photo -- not included", "not-found"
+                if o.label in reconciled:
+                    detail = ("named by the VLM; GroundingDINO's detections were checked "
+                              "against it by a text-matching model, but none matched -- "
+                              "not included")
+                else:
+                    detail = "named by the VLM, but GroundingDINO found no matching box at all -- not included"
+                tag = "not-found"
             elif group_flat.get(o.group):
-                detail, tag = "flat surface (picture/rug/etc.) -- deliberately not modelled in 3D", "skipped"
+                how = "detected directly" if o.label in matched_directly else "matched via wording reconciliation"
+                detail = f"flat surface (picture/rug/etc.), {how} -- deliberately not modelled in 3D"
+                tag = "skipped"
             else:
-                detail, tag = "detected and included in the scene", "included"
+                how = ("detected directly" if o.label in matched_directly
+                      else f"GroundingDINO called it {vlm_stats.get('detected_as', {}).get(o.label, '?')!r} -- matched by wording")
+                detail = f"{how}, included in the scene"
+                tag = "included"
             list_items.append({"label": o.label, "detail": f"group: {o.group} — {detail}",
                                "tag": tag})
         if not scene_objects:
@@ -1230,9 +1303,10 @@ async def scene_stepwise_endpoint(
         det_boxes = list(boxes_by_label.values())
         det_source = draw_detection_boxes(image, det_boxes) if det_boxes else image
         add_stage("detection", "Per-label detection",
-                  f"GroundingDINO run once per VLM-named label instead of a fixed "
-                  f"vocabulary -- {len(det_boxes)} of {len(scene_objects)} named objects "
-                  "were actually found in the photo.",
+                  f"GroundingDINO queried once with every VLM-named label, then a "
+                  f"lightweight text-only model reconciles any wording mismatches "
+                  f"against what it actually found -- {len(det_boxes)} of "
+                  f"{len(scene_objects)} named objects ended up with a real box.",
                   type="image", image_base64=png_b64(resize_max(det_source)))
 
         stats["segmentation"] = {
