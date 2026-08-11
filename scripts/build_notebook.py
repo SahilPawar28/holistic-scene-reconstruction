@@ -939,13 +939,6 @@ def generate_triposg_mesh(image, num_inference_steps=24, guidance_scale=7.0, see
                 "left after removing NaN/Inf vertices."
             )
 
-    # TripoSG's own pipeline is geometry-only -- see project_photo_colors's
-    # docstring for why. `prepared` (not the raw original photo) is what to
-    # sample: it's the same background-removed, correctly-framed image the
-    # model itself was conditioned on, so its proportions/centering actually
-    # match the mesh's canonical frame.
-    mesh = project_photo_colors(mesh, prepared)
-
     return mesh
 
 
